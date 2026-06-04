@@ -5,22 +5,39 @@ struct FrameData
     // float3 camera_pos;
 };
 
-// struct ObjectData
-// {
-//     float4x4 transform;
-//     float3x3 normal_transform;
-// };
+struct ObjectData
+{
+    float4x4 transform;
+    float3x3 normal_transform;
+};
 
-// struct PushConstants
-// {
-//     FrameData* frame;
-//     ObjectData* objects;
-//     uint object_id;
-//     uint material_id;
-// };
+struct MaterialData
+{
+    float4 albedo_factor;
+    float3 emissive_factor;
+    float metallic_factor;
+    float roughness_factor;
+    float alpha_cutoff;
+    int base_color_texture;
+    int metallic_roughness_texture;
+    int normal_texture;
+    int occlusion_texture;
+    int emissive_texture;
+    uint albedo_sampler_index;
+    uint metallic_roughness_sampler_index;
+    uint normal_sampler_index;
+    uint occlusion_sampler_index;
+    uint emissive_sampler_index;
+};
 
-// [vk::push_constant]
-// uniform PushConstants push;
+struct PushConstants
+{
+    FrameData *frame;
+    ObjectData *objects;
+    MaterialData *materials;
+    uint object_id;
+    uint material_id;
+};
 
 struct VertexInput
 {
@@ -39,22 +56,25 @@ struct VertexOutput
 };
 
 [shader("vertex")]
-VertexOutput vertex(VertexInput input, uniform FrameData *shader_data)
+VertexOutput vertex(VertexInput input, uniform PushConstants data)
 {
     VertexOutput res;
 
     // let object = push.objects[push.object_id];
-    // let world_pos = mul(object.transform, float4(input.position, 1.0));
+    let world_pos = mul(data.objects[data.object_id].transform, float4(input.position, 1.0));
 
     res.color = input.color;
-    res.position = mul(shader_data.view_proj, float4(input.position, 1.0));
-    res.position = float4(input.position, 1.0);
+    res.position = mul(data.frame.view_proj, world_pos);
+    // res.position = float4(input.position, 1.0);
     res.normal = input.normal;
     return res;
 }
 
 [shader("fragment")]
-float4 fragment(VertexOutput in) : SV_Target
+float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
 {
-    return float4(in.normal, 1.0);
+    let material = data.materials[data.material_id];
+
+    let albedo = in.color * material.albedo_factor.rgb;
+    return float4(albedo, 1.0);
 }

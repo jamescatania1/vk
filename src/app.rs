@@ -1,6 +1,10 @@
-use std::ffi::{CStr, CString};
+use std::{
+    ffi::{CStr, CString},
+    time::{Duration, Instant},
+};
 
 use ash::vk::{self};
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use vk_mem::Alloc;
 use winit::{
@@ -8,7 +12,7 @@ use winit::{
     window::Window,
 };
 
-use crate::shaders::Shaders;
+use crate::{camera::Camera, input::Input, shaders::Shaders};
 
 pub struct App {
     entry: ash::Entry,
@@ -21,7 +25,6 @@ pub struct App {
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
     queue: vk::Queue,
-    queue_family_index: u32,
     allocator: vk_mem::Allocator,
 
     swapchain_loader: ash::khr::swapchain::Device,
@@ -33,21 +36,88 @@ pub struct App {
     depth_allocation: vk_mem::Allocation,
     depth_view: vk::ImageView,
     scene: SceneResources,
+    frame_data: Vec<(
+        vk::Buffer,
+        vk_mem::Allocation,
+        *mut FrameData,
+        vk::DeviceAddress,
+    )>,
+    frame_id: u64,
+    prev_fixed_time: Instant,
+    prev_frame_time: Instant,
+    avg_delta_time: Duration,
+    pub input: Input,
+    camera: Camera,
+    cursor_locked: bool,
+    pub recreate_swapchain: bool,
 
+    pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     command_buffers: Vec<vk::CommandBuffer>,
     frame_fences: Vec<vk::Fence>,
     image_acquired_semaphores: Vec<vk::Semaphore>,
-    frame_complete_semaphores: Vec<vk::Semaphore>,
+    render_complete_semaphores: Vec<vk::Semaphore>,
     image_index: usize,
     frame_index: usize,
 }
 
+#[derive(Debug)]
 struct SceneResources {
     vertex_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
     index_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
     index_counts: Vec<u32>,
-    primitive_push_constants: Vec<PushConstants>,
+    object_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
+    material_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
+    primitive_indices: Vec<PrimitiveIndices>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PrimitiveIndices {
+    pub object_id: u32,
+    pub material_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct FrameData {
+    pub view_proj: [[f32; 4]; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
+#[repr(C)]
+pub struct ObjectData {
+    pub transform: [[f32; 4]; 4],
+    pub normal_transform: [[f32; 3]; 3],
+}
+
+#[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
+#[repr(C)]
+struct MaterialData {
+    pub albedo_factor: [f32; 4],
+    pub emissive_factor: [f32; 3],
+    pub metallic_factor: f32,
+    pub roughness_factor: f32,
+    pub alpha_cutoff: f32,
+    pub base_color_texture: i32,
+    pub metallic_roughness_texture: i32,
+    pub normal_texture: i32,
+    pub occlusion_texture: i32,
+    pub emissive_texture: i32,
+    pub albedo_sampler_index: u32,
+    pub metallic_roughness_sampler_index: u32,
+    pub normal_sampler_index: u32,
+    pub occlusion_sampler_index: u32,
+    pub emissive_sampler_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, Zeroable, Pod)]
+#[repr(C)]
+struct PushConstants {
+    frame_ptr: vk::DeviceAddress,
+    objects_ptr: vk::DeviceAddress,
+    materials_ptr: vk::DeviceAddress,
+    object_id: u32,
+    material_id: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,30 +130,184 @@ struct VertexData {
     uv: [f32; 2],
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct PushConstants {
-    pub object_id: u32,
-    pub material_id: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct ShaderData {
-    view_proj: [[f32; 4]; 4],
-}
-
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
+const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 
 impl SceneResources {
-    fn create(allocator: &vk_mem::Allocator) -> Self {
+    fn create(device: &ash::Device, allocator: &vk_mem::Allocator) -> Self {
         let (document, buffers, images) = gltf::import("assets/sponza.glb").unwrap();
         let scene = document.default_scene().unwrap();
+
+        fn walk_transform(node: gltf::Node, parent: Mat4, out: &mut [Mat4]) {
+            let local = Mat4::from_cols_array_2d(&node.transform().matrix());
+            let transform = parent * local;
+            out[node.index()] = transform;
+            for child in node.children() {
+                walk_transform(child, transform, out);
+            }
+        }
+        let mut transforms = vec![Mat4::IDENTITY; document.nodes().len()];
+        for root in scene.nodes() {
+            let base_transform = Mat4::from_rotation_translation(
+                Quat::from_axis_angle(Vec3::X, 90.0f32.to_radians()),
+                Vec3::ZERO,
+            );
+            walk_transform(root, base_transform, &mut transforms);
+        }
+
+        let object_buffer = {
+            let size = std::mem::size_of::<ObjectData>() * transforms.len();
+            let (buffer, allocation) = unsafe {
+                allocator
+                    .create_buffer(
+                        &vk::BufferCreateInfo::default().size(size as u64).usage(
+                            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                                | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        ),
+                        &vk_mem::AllocationCreateInfo {
+                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                                | vk_mem::AllocationCreateFlags::MAPPED,
+                            usage: vk_mem::MemoryUsage::Auto,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            };
+            let mapped = allocator
+                .get_allocation_info(&allocation)
+                .mapped_data
+                .cast::<u8>();
+
+            let transforms = transforms
+                .into_iter()
+                .map(|transform| ObjectData {
+                    transform: transform.to_cols_array_2d(),
+                    normal_transform: Mat3::from_mat4(transform)
+                        .inverse()
+                        .transpose()
+                        .to_cols_array_2d(),
+                })
+                .collect::<Vec<_>>();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytemuck::cast_slice(&transforms).as_ptr(),
+                    mapped,
+                    size,
+                );
+            }
+            allocator
+                .flush_allocation(&allocation, 0, size as u64)
+                .unwrap();
+
+            let address = unsafe {
+                device.get_buffer_device_address(
+                    &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+                )
+            };
+            (buffer, allocation, address)
+        };
+
+        let material_buffer = {
+            let materials = document
+                .materials()
+                .into_iter()
+                .map(|mat| {
+                    let pbr = mat.pbr_metallic_roughness();
+                    MaterialData {
+                        albedo_factor: pbr.base_color_factor(),
+                        emissive_factor: mat.emissive_factor(),
+                        metallic_factor: pbr.metallic_factor(),
+                        roughness_factor: pbr.roughness_factor(),
+                        alpha_cutoff: mat.alpha_cutoff().unwrap_or(0.5),
+                        base_color_texture: pbr
+                            .base_color_texture()
+                            .map(|t| t.texture().source().index() as i32)
+                            .unwrap_or(-1),
+                        metallic_roughness_texture: pbr
+                            .metallic_roughness_texture()
+                            .map(|t| t.texture().source().index() as i32)
+                            .unwrap_or(-1),
+                        normal_texture: mat
+                            .normal_texture()
+                            .map(|t| t.texture().source().index() as i32)
+                            .unwrap_or(-1),
+                        occlusion_texture: mat
+                            .occlusion_texture()
+                            .map(|t| t.texture().source().index() as i32)
+                            .unwrap_or(-1),
+                        emissive_texture: mat
+                            .emissive_texture()
+                            .map(|t| t.texture().source().index() as i32)
+                            .unwrap_or(-1),
+                        albedo_sampler_index: pbr
+                            .base_color_texture()
+                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .unwrap_or(0),
+                        metallic_roughness_sampler_index: pbr
+                            .metallic_roughness_texture()
+                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .unwrap_or(0),
+                        normal_sampler_index: mat
+                            .normal_texture()
+                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .unwrap_or(0),
+                        occlusion_sampler_index: mat
+                            .occlusion_texture()
+                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .unwrap_or(0),
+                        emissive_sampler_index: mat
+                            .emissive_texture()
+                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .unwrap_or(0),
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let size = std::mem::size_of::<MaterialData>() * materials.len();
+            let (buffer, allocation) = unsafe {
+                allocator
+                    .create_buffer(
+                        &vk::BufferCreateInfo::default().size(size as u64).usage(
+                            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                                | vk::BufferUsageFlags::STORAGE_BUFFER,
+                        ),
+                        &vk_mem::AllocationCreateInfo {
+                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                                | vk_mem::AllocationCreateFlags::MAPPED,
+                            usage: vk_mem::MemoryUsage::Auto,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            };
+            let mapped = allocator
+                .get_allocation_info(&allocation)
+                .mapped_data
+                .cast::<u8>();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytemuck::cast_slice(&materials).as_ptr(),
+                    mapped,
+                    size,
+                );
+            }
+            allocator
+                .flush_allocation(&allocation, 0, size as u64)
+                .unwrap();
+
+            let address = unsafe {
+                device.get_buffer_device_address(
+                    &vk::BufferDeviceAddressInfo::default().buffer(buffer),
+                )
+            };
+            (buffer, allocation, address)
+        };
 
         let mut vertex_buffers = Vec::new();
         let mut index_buffers = Vec::new();
         let mut index_counts = Vec::new();
-        let mut primitive_push_constants = Vec::new();
+        let mut primitive_indices = Vec::new();
 
         for node in scene.nodes() {
             let Some(mesh) = node.mesh() else {
@@ -96,9 +320,15 @@ impl SceneResources {
 
                 let vertex_count = positions.len();
                 let normals = reader.read_normals().unwrap();
-                let Some(tangents) = reader.read_tangents() else {
-                    eprintln!("no tangents for primitive {}, skipping", primitive.index());
-                    continue;
+                // let Some(tangents) = reader.read_tangents() else {
+                //     eprintln!("no tangents for primitive {}, skipping", primitive.index());
+                //     continue;
+                // };
+                let tangents: Box<dyn ExactSizeIterator<Item = [f32; 4]> + '_> = match reader
+                    .read_tangents()
+                {
+                    Some(tangents) => Box::new(tangents),
+                    None => Box::new(std::iter::repeat([1.0f32, 0.0, 0.0, 1.0]).take(vertex_count)),
                 };
                 let colors: Box<dyn ExactSizeIterator<Item = [f32; 3]> + '_> =
                     match reader.read_colors(0) {
@@ -132,7 +362,7 @@ impl SceneResources {
                     .into_u32()
                     .collect::<Vec<_>>();
 
-                primitive_push_constants.push(PushConstants {
+                primitive_indices.push(PrimitiveIndices {
                     object_id: node.index() as u32,
                     material_id: primitive.material().index().unwrap_or(0) as u32,
                 });
@@ -192,7 +422,9 @@ impl SceneResources {
             vertex_buffers,
             index_buffers,
             index_counts,
-            primitive_push_constants,
+            object_buffer,
+            material_buffer,
+            primitive_indices,
         }
     }
 }
@@ -319,7 +551,8 @@ impl App {
             .shader_sampled_image_array_non_uniform_indexing(true)
             .descriptor_binding_variable_descriptor_count(true)
             .runtime_descriptor_array(true)
-            .buffer_device_address(true);
+            .buffer_device_address(true)
+            .scalar_block_layout(true);
         let mut vk_13_features = vk::PhysicalDeviceVulkan13Features::default()
             .synchronization2(true)
             .dynamic_rendering(true);
@@ -367,8 +600,7 @@ impl App {
                 .get_physical_device_surface_capabilities(physical_device, surface)
                 .unwrap()
         };
-        const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
-        const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+
         let (swapchain, swapchain_images, swapchain_image_views) = unsafe {
             let swapchain = swapchain_loader
                 .create_swapchain(
@@ -450,19 +682,27 @@ impl App {
                 .unwrap()
         };
 
-        let scene = SceneResources::create(&allocator);
+        let mut render_complete_semaphores = Vec::new();
+        for _ in 0..swapchain_images.len() {
+            render_complete_semaphores
+                .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
+        }
 
-        let mut buffers = Vec::new();
+        let scene = SceneResources::create(&device, &allocator);
+
+        let mut frame_data = Vec::new();
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             let (buffer, allocation) = unsafe {
                 allocator
                     .create_buffer(
                         &vk::BufferCreateInfo::default()
-                            .size(std::mem::size_of::<ShaderData>() as u64)
-                            .usage(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS),
+                            .size(std::mem::size_of::<FrameData>() as u64)
+                            .usage(
+                                vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                                    | vk::BufferUsageFlags::STORAGE_BUFFER,
+                            ),
                         &vk_mem::AllocationCreateInfo {
                             flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::HOST_ACCESS_ALLOW_TRANSFER_INSTEAD
                                 | vk_mem::AllocationCreateFlags::MAPPED,
                             usage: vk_mem::MemoryUsage::Auto,
                             ..Default::default()
@@ -470,12 +710,16 @@ impl App {
                     )
                     .unwrap()
             };
+            let mapped = allocator
+                .get_allocation_info(&allocation)
+                .mapped_data
+                .cast::<FrameData>();
             let address = unsafe {
                 device.get_buffer_device_address(
                     &vk::BufferDeviceAddressInfo::default().buffer(buffer),
                 )
             };
-            buffers.push((buffer, allocation, address));
+            frame_data.push((buffer, allocation, mapped, address));
         }
 
         let command_pool = unsafe {
@@ -519,12 +763,6 @@ impl App {
                 .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
         }
 
-        let mut frame_complete_semaphores = Vec::new();
-        for _ in 0..swapchain_images.len() {
-            frame_complete_semaphores
-                .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
-        }
-
         let shaders = Shaders::new();
         let shader_vertex = unsafe {
             device
@@ -546,9 +784,13 @@ impl App {
         let pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .push_constant_ranges(&[vk::PushConstantRange::default()
-                            .size(std::mem::size_of::<vk::DeviceAddress>() as u32)]),
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
+                        vk::PushConstantRange::default()
+                            .stage_flags(
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            )
+                            .size(std::mem::size_of::<PushConstants>() as u32),
+                    ]),
                     None,
                 )
                 .unwrap()
@@ -650,73 +892,122 @@ impl App {
         };
 
         Self {
+            entry,
             window,
             allocator,
             depth_view,
-            entry,
             instance,
             surface_loader,
             surface,
             device,
             physical_device,
             queue,
-            queue_family_index,
             swapchain_loader,
             swapchain,
             swapchain_images,
             swapchain_image_views,
             depth_image,
             depth_allocation,
+            frame_data,
             scene,
+            frame_id: 0,
+            prev_frame_time: Instant::now(),
+            prev_fixed_time: Instant::now(),
+            avg_delta_time: Duration::ZERO,
+            input: Default::default(),
+            camera: Camera::new(),
+            cursor_locked: false,
+            recreate_swapchain: false,
+            pipeline_layout,
             pipeline,
             command_buffers,
             frame_fences,
             image_acquired_semaphores,
-            frame_complete_semaphores,
+            render_complete_semaphores,
             image_index: 0,
             frame_index: 0,
         }
     }
 
     pub fn frame(&mut self) {
+        let time = Instant::now();
+        let delta_time = time - self.prev_frame_time;
+        self.prev_frame_time = time;
+
         unsafe {
             self.device
                 .wait_for_fences(&[self.frame_fences[self.frame_index]], true, u64::MAX)
                 .unwrap();
+        };
+
+        if self.recreate_swapchain {
+            self.recreate_swapchain();
+        }
+
+        let (next_image_index, _suboptimal) = unsafe {
+            match self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_acquired_semaphores[self.frame_index],
+                vk::Fence::null(),
+            ) {
+                Ok(res) => res,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain = true;
+                    return;
+                }
+                Err(err) => {
+                    panic!("{err}");
+                }
+            }
+        };
+
+        unsafe {
             self.device
                 .reset_fences(&[self.frame_fences[self.frame_index]])
                 .unwrap()
-        };
-
-        let (next_image_index, _suboptimal) = unsafe {
-            self.swapchain_loader
-                .acquire_next_image(
-                    self.swapchain,
-                    u64::MAX,
-                    self.image_acquired_semaphores[self.frame_index],
-                    vk::Fence::null(),
-                )
-                .unwrap()
-        };
+        }
         self.image_index = next_image_index as usize;
 
         let size = self.window.inner_size();
 
-        let shader_data = {
-            let view =
-                glam::Mat4::look_at_rh(glam::vec3(0.0, -1.0, 0.0), glam::Vec3::ZERO, glam::Vec3::Z);
-            let mut proj = glam::Mat4::perspective_rh(
-                90.0f32.to_radians(),
-                size.width as f32 / size.height.max(1) as f32,
-                0.1,
-                100.0,
-            );
-            proj.y_axis.y *= -1.0;
-            let view_proj = proj * view;
-            ShaderData {
-                view_proj: view_proj.to_cols_array_2d(),
-            }
-        };
+        if !self.cursor_locked && self.input.mouse.left.clicked {
+            self.cursor_locked = true;
+            self.window
+                .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                .or_else(|_| {
+                    self.window
+                        .set_cursor_grab(winit::window::CursorGrabMode::Confined)
+                })
+                .unwrap();
+            self.window.set_cursor_visible(false);
+        } else if self.cursor_locked && self.input.key_down(winit::keyboard::KeyCode::Space) {
+            self.cursor_locked = false;
+
+            self.window
+                .set_cursor_grab(winit::window::CursorGrabMode::None)
+                .unwrap();
+            self.window.set_cursor_visible(true);
+        }
+        self.camera.update(
+            glam::uvec2(size.width, size.height),
+            &delta_time,
+            &self.input,
+            self.cursor_locked,
+        );
+        self.input.update();
+
+        unsafe {
+            let mapped = self.frame_data[self.frame_index].2;
+            (*mapped).view_proj = self.camera.view_proj.to_cols_array_2d();
+        }
+        self.allocator
+            .flush_allocation(
+                &self.frame_data[self.frame_index].1,
+                0,
+                std::mem::size_of::<FrameData>() as u64,
+            )
+            .unwrap();
 
         let cb = self.command_buffers[self.frame_index];
 
@@ -783,7 +1074,7 @@ impl App {
                         .store_op(vk::AttachmentStoreOp::STORE)
                         .clear_value(vk::ClearValue {
                             color: vk::ClearColorValue {
-                                float32: [0.0, 0.0, 1.0, 1.0],
+                                float32: [0.0, 0.0, 0.0, 1.0],
                             },
                         })])
                     .depth_attachment(
@@ -834,6 +1125,19 @@ impl App {
                     0,
                     vk::IndexType::UINT32,
                 );
+                self.device.cmd_push_constants(
+                    cb,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    bytemuck::bytes_of(&PushConstants {
+                        frame_ptr: self.frame_data[self.frame_index].3,
+                        objects_ptr: self.scene.object_buffer.2,
+                        materials_ptr: self.scene.material_buffer.2,
+                        object_id: self.scene.primitive_indices[i].object_id,
+                        material_id: self.scene.primitive_indices[i].material_id,
+                    }),
+                );
                 self.device
                     .cmd_draw_indexed(cb, self.scene.index_counts[i], 1, 0, 0, 0);
             }
@@ -866,24 +1170,170 @@ impl App {
                         .wait_semaphores(&[self.image_acquired_semaphores[self.frame_index]])
                         .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
                         .command_buffers(&[cb])
-                        .signal_semaphores(&[self.frame_complete_semaphores[self.image_index]])],
+                        .signal_semaphores(&[self.render_complete_semaphores[self.image_index]])],
                     self.frame_fences[self.frame_index],
                 )
                 .unwrap();
 
             self.frame_index = (self.frame_index + 1) % (MAX_FRAMES_IN_FLIGHT as usize);
 
-            self.swapchain_loader
-                .queue_present(
-                    self.queue,
-                    &vk::PresentInfoKHR::default()
-                        .wait_semaphores(&[self.frame_complete_semaphores[self.image_index]])
-                        .swapchains(&[self.swapchain])
-                        .image_indices(&[self.image_index as u32]),
-                )
-                .unwrap();
+            match self.swapchain_loader.queue_present(
+                self.queue,
+                &vk::PresentInfoKHR::default()
+                    .wait_semaphores(&[self.render_complete_semaphores[self.image_index]])
+                    .swapchains(&[self.swapchain])
+                    .image_indices(&[self.image_index as u32]),
+            ) {
+                Ok(suboptimal) => {
+                    if suboptimal {
+                        self.recreate_swapchain = true;
+                    }
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain = true;
+                }
+                Err(err) => panic!("{err}"),
+            }
             self.window.pre_present_notify();
+
+            const FRAME_ACC_ALPHA: f64 = 1.0 / 120.0;
+            self.avg_delta_time = self.avg_delta_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
+                + delta_time.mul_f64(FRAME_ACC_ALPHA);
+            self.frame_id = self.frame_id.wrapping_add(1);
+
+            if self.prev_fixed_time.elapsed().as_secs_f32() >= 1.0 {
+                self.prev_fixed_time = time;
+                println!("frame time: {:#?}", self.avg_delta_time);
+                println!("FPS: {:.2}", 1.0 / self.avg_delta_time.as_secs_f64());
+            }
         };
+    }
+
+    fn recreate_swapchain(&mut self) {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+
+        self.recreate_swapchain = false;
+        unsafe { self.device.device_wait_idle().unwrap() };
+
+        let old_swapchain = self.swapchain;
+
+        for sem in self.render_complete_semaphores.drain(..) {
+            unsafe { self.device.destroy_semaphore(sem, None) };
+        }
+        for view in self.swapchain_image_views.drain(..) {
+            unsafe { self.device.destroy_image_view(view, None) };
+        }
+        unsafe {
+            self.device.destroy_image_view(self.depth_view, None);
+            self.allocator
+                .destroy_image(self.depth_image, &mut self.depth_allocation);
+        }
+
+        let surface_capabilities = unsafe {
+            self.surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .unwrap()
+        };
+
+        self.swapchain = unsafe {
+            self.swapchain_loader
+                .create_swapchain(
+                    &vk::SwapchainCreateInfoKHR::default()
+                        .surface(self.surface)
+                        .min_image_count(surface_capabilities.min_image_count)
+                        .image_format(SWAPCHAIN_FORMAT)
+                        .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                        .image_extent(surface_capabilities.current_extent)
+                        .image_array_layers(1)
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                        .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                        .present_mode(vk::PresentModeKHR::FIFO)
+                        .old_swapchain(old_swapchain),
+                    None,
+                )
+                .unwrap()
+        };
+
+        unsafe { self.swapchain_loader.destroy_swapchain(old_swapchain, None) };
+
+        self.swapchain_images = unsafe {
+            self.swapchain_loader
+                .get_swapchain_images(self.swapchain)
+                .unwrap()
+        };
+        self.swapchain_image_views = self
+            .swapchain_images
+            .iter()
+            .map(|img| unsafe {
+                self.device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(*img)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(SWAPCHAIN_FORMAT)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .level_count(1)
+                                    .layer_count(1),
+                            ),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        (self.depth_image, self.depth_allocation) = unsafe {
+            self.allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(DEPTH_FORMAT)
+                        .extent(surface_capabilities.current_extent.into())
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                        usage: vk_mem::MemoryUsage::Auto,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        self.depth_view = unsafe {
+            self.device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image: self.depth_image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format: DEPTH_FORMAT,
+                        subresource_range: vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+
+        self.render_complete_semaphores = Vec::new();
+        for _ in 0..self.swapchain_images.len() {
+            self.render_complete_semaphores.push(unsafe {
+                self.device
+                    .create_semaphore(&Default::default(), None)
+                    .unwrap()
+            });
+        }
     }
 }
 

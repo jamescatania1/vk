@@ -1,12 +1,12 @@
 use std::{
     env,
     fs::{self},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use heck::{ToPascalCase, ToSnakeCase};
 use proc_macro2::TokenStream;
-use shader_slang::{Downcast, reflection};
+use shader_slang::Downcast;
 
 fn main() {
     // println!("cargo:rerun-if-changed=shaders");
@@ -18,7 +18,8 @@ fn main() {
 
     let opts = shader_slang::CompilerOptions::default()
         .optimization(shader_slang::OptimizationLevel::High)
-        .matrix_layout_column(true);
+        .matrix_layout_column(true)
+        .glsl_force_scalar_layout(true);
     let targets = [shader_slang::TargetDesc::default()
         .format(shader_slang::CompileTarget::Spirv)
         .profile(global_session.find_profile("spirv_1_5"))];

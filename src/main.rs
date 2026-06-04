@@ -8,6 +8,8 @@ use winit::{
 };
 
 mod app;
+mod camera;
+mod input;
 use app::App;
 
 include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
@@ -48,9 +50,19 @@ impl ApplicationHandler for Program {
                 app.frame();
                 app.window.request_redraw();
             }
+            WindowEvent::MouseInput { state, button, .. } => {
+                app.input.handle_mouse(&state, &button);
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if !event.repeat {
+                    app.input.handle_keyboard(&app.window, event_loop, &event);
+                }
+            }
+            WindowEvent::Resized(_) => {
+                app.recreate_swapchain = true;
+            }
             _ => {}
         };
-        // app.window_event(event_loop, window_id, event).unwrap();
     }
 
     fn device_event(
@@ -62,7 +74,8 @@ impl ApplicationHandler for Program {
         let Some(app) = &mut self.app else {
             return;
         };
-        // app.device_event(event_loop, device_id, event);
+        app.input
+            .handle_device_input(&app.window, event_loop, &event);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
