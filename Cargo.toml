@@ -1,0 +1,28 @@
+[package]
+name = "vk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ash = "0.38.0"
+ash-window = "0.13.0"
+bytemuck = "1.24.0"
+glam = "0.33.0"
+gltf = "1.4.1"
+vk-mem = "0.5.0"
+winit = "0.30.13"
+
+[build-dependencies]
+walkdir = "2"
+which = "8.0.2"
+shader-slang = "0.1.0"
+bytemuck = { version = "1.24.0", features = ["derive"] }
+proc-macro2 = "1.0.106"
+quote = "1.0.44"
+heck = "0.5.0"
+syn = "2.0.116"
+prettyplease = "0.2.37"
+
+
+[profile.dev]
+opt-level = 1
