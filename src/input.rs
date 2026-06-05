@@ -13,6 +13,7 @@ pub struct Input {
     pub mouse: Mouse,
     pub scroll: f64,
     pressed_keys: HashSet<KeyCode>,
+    down_keys: HashSet<KeyCode>,
     released_keys: HashSet<KeyCode>,
 }
 
@@ -64,9 +65,11 @@ impl Input {
             match event.state {
                 ElementState::Pressed => {
                     self.pressed_keys.insert(code);
+                    self.down_keys.insert(code);
                 }
                 ElementState::Released => {
                     self.pressed_keys.remove(&code);
+                    self.down_keys.remove(&code);
                 }
             }
         }
@@ -90,6 +93,10 @@ impl Input {
     }
 
     pub fn key_down(&self, code: KeyCode) -> bool {
+        self.down_keys.contains(&code)
+    }
+
+    pub fn key_pressed(&self, code: KeyCode) -> bool {
         self.pressed_keys.contains(&code)
     }
 
@@ -101,6 +108,7 @@ impl Input {
         self.mouse.right.released = false;
         self.mouse.delta *= 0.0;
         self.mouse.scroll_delta = 0.0;
+        self.pressed_keys.clear();
     }
 }
 

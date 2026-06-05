@@ -42,19 +42,39 @@ impl ApplicationHandler for Program {
             return;
         };
 
-        match event {
+        match event.clone() {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
+                return;
             }
             WindowEvent::RedrawRequested => {
                 app.frame();
                 app.window.request_redraw();
+                return;
             }
+            event => {
+                if !app.cursor_locked {
+                    let generic_event: winit::event::Event<winit::event::WindowEvent> =
+                        winit::event::Event::WindowEvent { window_id, event };
+                    app.imgui_platform.handle_event(
+                        app.imgui.io_mut(),
+                        &app.window,
+                        &generic_event,
+                    );
+                }
+            }
+        }
+
+        let io = app.imgui.io();
+
+        match event {
             WindowEvent::MouseInput { state, button, .. } => {
-                app.input.handle_mouse(&state, &button);
+                if !io.want_capture_mouse {
+                    app.input.handle_mouse(&state, &button);
+                }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if !event.repeat {
+                if !io.want_capture_keyboard && !event.repeat {
                     app.input.handle_keyboard(&app.window, event_loop, &event);
                 }
             }
@@ -74,6 +94,15 @@ impl ApplicationHandler for Program {
         let Some(app) = &mut self.app else {
             return;
         };
+
+        let generic_event: winit::event::Event<winit::event::DeviceEvent> =
+            winit::event::Event::DeviceEvent {
+                device_id,
+                event: event.clone(),
+            };
+        app.imgui_platform
+            .handle_event(app.imgui.io_mut(), &app.window, &generic_event);
+
         app.input
             .handle_device_input(&app.window, event_loop, &event);
     }

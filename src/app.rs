@@ -24,6 +24,7 @@ pub struct App {
 
     device: ash::Device,
     physical_device: vk::PhysicalDevice,
+    physical_device_properties: vk::PhysicalDeviceProperties,
     queue: vk::Queue,
     allocator: vk_mem::Allocator,
 
@@ -31,6 +32,7 @@ pub struct App {
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_views: Vec<vk::ImageView>,
+    query_pool: vk::QueryPool,
 
     depth_image: vk::Image,
     depth_allocation: vk_mem::Allocation,
@@ -46,10 +48,15 @@ pub struct App {
     prev_fixed_time: Instant,
     prev_frame_time: Instant,
     avg_delta_time: Duration,
+    avg_gpu_time: Duration,
     pub input: Input,
     camera: Camera,
-    cursor_locked: bool,
+    pub cursor_locked: bool,
     pub recreate_swapchain: bool,
+
+    pub imgui: imgui::Context,
+    pub imgui_platform: imgui_winit_support::WinitPlatform,
+    imgui_renderer: imgui_rs_vulkan_renderer::Renderer,
 
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
@@ -69,7 +76,8 @@ struct SceneResources {
     vertex_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
     index_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
     index_counts: Vec<u32>,
-    images: Vec<(vk::Image, vk_mem::Allocation, vk::ImageView, vk::Sampler)>,
+    images: Vec<(vk::Image, vk_mem::Allocation, vk::ImageView)>,
+    samplers: Vec<vk::Sampler>,
     object_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
     material_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
     primitive_indices: Vec<PrimitiveIndices>,
@@ -136,11 +144,15 @@ struct VertexData {
 }
 
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+const QUERY_COUNT: u32 = 2;
+const FRAME_ACC_ALPHA: f64 = 1.0 / 30.0;
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+const ANISOTROPIC_SAMPLES: f32 = 16.0;
 
 impl SceneResources {
     fn create(
+        physical_device_properties: &vk::PhysicalDeviceProperties,
         device: &ash::Device,
         queue: &vk::Queue,
         allocator: &vk_mem::Allocator,
@@ -218,6 +230,48 @@ impl SceneResources {
             (buffer, allocation, address)
         };
 
+        let mut samplers = Vec::new();
+        const ADDRESS_MODES: [vk::SamplerAddressMode; 3] = [
+            vk::SamplerAddressMode::CLAMP_TO_EDGE,
+            vk::SamplerAddressMode::REPEAT,
+            vk::SamplerAddressMode::MIRRORED_REPEAT,
+        ];
+        for address_mode_u in ADDRESS_MODES {
+            for address_mode_v in ADDRESS_MODES {
+                samplers.push(unsafe {
+                    device
+                        .create_sampler(
+                            &&&&vk::SamplerCreateInfo::default()
+                                .address_mode_u(address_mode_u)
+                                .address_mode_v(address_mode_v)
+                                .mag_filter(vk::Filter::LINEAR)
+                                .min_filter(vk::Filter::LINEAR)
+                                .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                                .min_lod(0.0)
+                                .max_lod(vk::LOD_CLAMP_NONE)
+                                .anisotropy_enable(true)
+                                .max_anisotropy(
+                                    ANISOTROPIC_SAMPLES.min(
+                                        physical_device_properties.limits.max_sampler_anisotropy,
+                                    ),
+                                ),
+                            None,
+                        )
+                        .unwrap()
+                });
+            }
+        }
+        fn sampler_index(sampler: &gltf::texture::Sampler<'_>) -> u32 {
+            const fn wrap_index(mode: gltf::texture::WrappingMode) -> u32 {
+                match mode {
+                    gltf::texture::WrappingMode::ClampToEdge => 0,
+                    gltf::texture::WrappingMode::Repeat => 1,
+                    gltf::texture::WrappingMode::MirroredRepeat => 2,
+                }
+            }
+            wrap_index(sampler.wrap_s()) * 3 + wrap_index(sampler.wrap_t())
+        }
+
         let material_buffer = {
             let materials = document
                 .materials()
@@ -252,23 +306,23 @@ impl SceneResources {
                             .unwrap_or(-1),
                         albedo_sampler_index: pbr
                             .base_color_texture()
-                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .map(|t| sampler_index(&t.texture().sampler()))
                             .unwrap_or(0),
                         metallic_roughness_sampler_index: pbr
                             .metallic_roughness_texture()
-                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .map(|t| sampler_index(&t.texture().sampler()))
                             .unwrap_or(0),
                         normal_sampler_index: mat
                             .normal_texture()
-                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .map(|t| sampler_index(&t.texture().sampler()))
                             .unwrap_or(0),
                         occlusion_sampler_index: mat
                             .occlusion_texture()
-                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .map(|t| sampler_index(&t.texture().sampler()))
                             .unwrap_or(0),
                         emissive_sampler_index: mat
                             .emissive_texture()
-                            .map(|t| t.texture().sampler().index().unwrap_or(0) as u32)
+                            .map(|t| sampler_index(&t.texture().sampler()))
                             .unwrap_or(0),
                     }
                 })
@@ -347,6 +401,7 @@ impl SceneResources {
                 }
                 (f, _) => panic!("bad format {:#?}", f),
             };
+            let mip_levels = img.width.max(img.height).ilog2() + 1;
             let (image, allocation) = unsafe {
                 allocator
                     .create_image(
@@ -358,11 +413,15 @@ impl SceneResources {
                                 height: img.height,
                                 depth: 1,
                             })
-                            .mip_levels(1)
+                            .mip_levels(mip_levels)
                             .array_layers(1)
                             .samples(vk::SampleCountFlags::TYPE_1)
                             .tiling(vk::ImageTiling::OPTIMAL)
-                            .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                            .usage(
+                                vk::ImageUsageFlags::TRANSFER_DST
+                                    | vk::ImageUsageFlags::SAMPLED
+                                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                            )
                             .initial_layout(vk::ImageLayout::UNDEFINED),
                         &vk_mem::AllocationCreateInfo {
                             usage: vk_mem::MemoryUsage::Auto,
@@ -381,7 +440,8 @@ impl SceneResources {
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .level_count(1)
+                                    .base_mip_level(0)
+                                    .level_count(mip_levels)
                                     .layer_count(1),
                             ),
                         None,
@@ -389,7 +449,7 @@ impl SceneResources {
                     .unwrap()
             };
 
-            let (transfer_buffer, transfer_allocation) = unsafe {
+            let (transfer_buffer, mut transfer_allocation) = unsafe {
                 allocator
                     .create_buffer(
                         &vk::BufferCreateInfo::default()
@@ -452,7 +512,8 @@ impl SceneResources {
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .level_count(1)
+                                    .base_mip_level(0)
+                                    .level_count(mip_levels)
                                     .layer_count(1),
                             ),
                     ]),
@@ -476,25 +537,125 @@ impl SceneResources {
                             depth: 1,
                         })],
                 );
+
+                // now we generate the mip chain
+                let mut w = img.width;
+                let mut h = img.height;
+
+                for i in 1..mip_levels {
+                    device.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[
+                            vk::ImageMemoryBarrier2::default()
+                                .image(image)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                .subresource_range(
+                                    vk::ImageSubresourceRange::default()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_mip_level(i - 1)
+                                        .level_count(1)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                ),
+                        ]),
+                    );
+
+                    let dst_w = (w / 2).max(1);
+                    let dst_h = (h / 2).max(1);
+
+                    device.cmd_blit_image(
+                        cb,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageBlit::default()
+                            .src_offsets([
+                                vk::Offset3D { x: 0, y: 0, z: 0 },
+                                vk::Offset3D {
+                                    x: w as i32,
+                                    y: h as i32,
+                                    z: 1,
+                                },
+                            ])
+                            .src_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .mip_level(i - 1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .dst_offsets([
+                                vk::Offset3D { x: 0, y: 0, z: 0 },
+                                vk::Offset3D {
+                                    x: dst_w as i32,
+                                    y: dst_h as i32,
+                                    z: 1,
+                                },
+                            ])
+                            .dst_subresource(
+                                vk::ImageSubresourceLayers::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .mip_level(i)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )],
+                        vk::Filter::LINEAR,
+                    );
+
+                    device.cmd_pipeline_barrier2(
+                        cb,
+                        &vk::DependencyInfo::default().image_memory_barriers(&[
+                            vk::ImageMemoryBarrier2::default()
+                                .image(image)
+                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                .subresource_range(
+                                    vk::ImageSubresourceRange::default()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_mip_level(i - 1)
+                                        .level_count(1)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                ),
+                        ]),
+                    );
+
+                    w = dst_w;
+                    h = dst_h;
+                }
+
                 device.cmd_pipeline_barrier2(
                     cb,
                     &vk::DependencyInfo::default().image_memory_barriers(&[
                         vk::ImageMemoryBarrier2::default()
+                            .image(image)
                             .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_READ)
                             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
-                            .image(image)
+                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(mip_levels - 1)
                                     .level_count(1)
+                                    .base_array_layer(0)
                                     .layer_count(1),
                             ),
                     ]),
                 );
+
                 device.end_command_buffer(cb).unwrap();
                 device
                     .queue_submit(
@@ -504,22 +665,10 @@ impl SceneResources {
                     )
                     .unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-                device.destroy_buffer(transfer_buffer, None);
+                allocator.destroy_buffer(transfer_buffer, &mut transfer_allocation);
             };
 
-            let sampler = unsafe {
-                device
-                    .create_sampler(
-                        &vk::SamplerCreateInfo::default()
-                            .mag_filter(vk::Filter::LINEAR)
-                            .min_filter(vk::Filter::LINEAR)
-                            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                            .anisotropy_enable(false),
-                        None,
-                    )
-                    .unwrap()
-            };
-            images.push((image, allocation, view, sampler));
+            images.push((image, allocation, view));
         }
 
         let mut vertex_buffers = Vec::new();
@@ -639,8 +788,9 @@ impl SceneResources {
         Self {
             vertex_buffers,
             index_buffers,
-            images,
             index_counts,
+            images,
+            samplers,
             object_buffer,
             material_buffer,
             primitive_indices,
@@ -722,7 +872,7 @@ impl App {
             .into_iter()
             .next()
             .unwrap();
-        let _physical_device_properties =
+        let physical_device_properties =
             unsafe { instance.get_physical_device_properties(physical_device) };
 
         let (queue_family_index, _queue_family) =
@@ -833,7 +983,7 @@ impl App {
                         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                         .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                        .present_mode(vk::PresentModeKHR::FIFO),
+                        .present_mode(vk::PresentModeKHR::IMMEDIATE),
                     None,
                 )
                 .unwrap();
@@ -929,16 +1079,67 @@ impl App {
                 .unwrap()
         };
 
-        let scene = SceneResources::create(&device, &queue, &allocator, &command_pool);
+        let query_pool = unsafe {
+            device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(MAX_FRAMES_IN_FLIGHT * QUERY_COUNT),
+                    None,
+                )
+                .unwrap()
+        };
+
+        let mut imgui = imgui::Context::create();
+        imgui.set_ini_filename(None);
+        let mut imgui_platform = imgui_winit_support::WinitPlatform::new(&mut imgui);
+        imgui_platform.attach_window(
+            imgui.io_mut(),
+            &window,
+            imgui_winit_support::HiDpiMode::Default,
+        );
+        let imgui_renderer = imgui_rs_vulkan_renderer::Renderer::with_default_allocator(
+            &instance,
+            physical_device,
+            device.clone(),
+            queue,
+            command_pool,
+            imgui_rs_vulkan_renderer::DynamicRendering {
+                color_attachment_format: SWAPCHAIN_FORMAT,
+                depth_attachment_format: Some(DEPTH_FORMAT),
+            },
+            &mut imgui,
+            Some(imgui_rs_vulkan_renderer::Options {
+                in_flight_frames: MAX_FRAMES_IN_FLIGHT as usize,
+                enable_depth_test: true,
+                enable_depth_write: true,
+                sample_count: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let scene = SceneResources::create(
+            &physical_device_properties,
+            &device,
+            &queue,
+            &allocator,
+            &command_pool,
+        );
 
         let descriptor_pool = unsafe {
             device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
                         .max_sets(1)
-                        .pool_sizes(&[vk::DescriptorPoolSize::default()
-                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(scene.images.len() as u32)]),
+                        .pool_sizes(&[
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                                .descriptor_count(scene.images.len() as u32),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::SAMPLER)
+                                .descriptor_count(scene.samplers.len() as u32),
+                        ]),
                     None,
                 )
                 .unwrap()
@@ -946,17 +1147,18 @@ impl App {
         let descriptor_set_layout = unsafe {
             device
                 .create_descriptor_set_layout(
-                    &&vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[
-                                    vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT,
-                                ]),
-                        )
-                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    &&vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                             .descriptor_count(scene.images.len() as u32)
-                            .stage_flags(vk::ShaderStageFlags::FRAGMENT)]),
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(1)
+                            .descriptor_type(vk::DescriptorType::SAMPLER)
+                            .descriptor_count(scene.samplers.len() as u32)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    ]),
                     None,
                 )
                 .unwrap()
@@ -965,10 +1167,6 @@ impl App {
             device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetVariableDescriptorCountAllocateInfo::default()
-                                .descriptor_counts(&[scene.images.len() as u32]),
-                        )
                         .descriptor_pool(descriptor_pool)
                         .set_layouts(&[descriptor_set_layout]),
                 )
@@ -977,21 +1175,33 @@ impl App {
         let image_infos = scene
             .images
             .iter()
-            .map(|(_, _, view, sampler)| {
+            .map(|(_, _, view)| {
                 vk::DescriptorImageInfo::default()
-                    .sampler(*sampler)
                     .image_view(*view)
-                    .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             })
+            .collect::<Vec<_>>();
+        let sampler_infos = scene
+            .samplers
+            .iter()
+            .map(|sampler| vk::DescriptorImageInfo::default().sampler(*sampler))
             .collect::<Vec<_>>();
         unsafe {
             device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(&image_infos)],
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_infos),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_infos),
+                ],
                 &[],
             )
         };
@@ -1146,7 +1356,8 @@ impl App {
                                 .scissor_count(1),
                         )
                         .rasterization_state(
-                            &vk::PipelineRasterizationStateCreateInfo::default().line_width(1.0),
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .cull_mode(vk::CullModeFlags::BACK),
                         )
                         .multisample_state(
                             &vk::PipelineMultisampleStateCreateInfo::default()
@@ -1185,6 +1396,7 @@ impl App {
             surface,
             device,
             physical_device,
+            physical_device_properties,
             queue,
             swapchain_loader,
             swapchain,
@@ -1198,12 +1410,17 @@ impl App {
             prev_frame_time: Instant::now(),
             prev_fixed_time: Instant::now(),
             avg_delta_time: Duration::ZERO,
+            avg_gpu_time: Duration::ZERO,
             input: Default::default(),
             camera: Camera::new(),
             cursor_locked: false,
             recreate_swapchain: false,
             pipeline_layout,
             pipeline,
+            imgui,
+            imgui_platform,
+            imgui_renderer,
+            query_pool,
             descriptor_pool,
             descriptor_set_layout,
             descriptor_set,
@@ -1225,6 +1442,30 @@ impl App {
             self.device
                 .wait_for_fences(&[self.frame_fences[self.frame_index]], true, u64::MAX)
                 .unwrap();
+        };
+
+        let query_base = self.frame_index as u32 * QUERY_COUNT;
+
+        let mut timestamps = [0u64; QUERY_COUNT as usize];
+        unsafe {
+            match self.device.get_query_pool_results(
+                self.query_pool,
+                query_base,
+                &mut timestamps,
+                vk::QueryResultFlags::TYPE_64,
+            ) {
+                Ok(()) => {
+                    let delta = Duration::from_nanos(
+                        (timestamps[1].wrapping_sub(timestamps[0]) as f64
+                            * self.physical_device_properties.limits.timestamp_period as f64)
+                            as u64,
+                    );
+                    self.avg_gpu_time = self.avg_gpu_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
+                        + delta.mul_f64(FRAME_ACC_ALPHA);
+                }
+                Err(vk::Result::NOT_READY) => {}
+                Err(err) => panic!("{err:?}"),
+            }
         };
 
         if self.recreate_swapchain {
@@ -1258,7 +1499,7 @@ impl App {
 
         let size = self.window.inner_size();
 
-        if !self.cursor_locked && self.input.mouse.left.clicked {
+        if !self.cursor_locked && self.input.key_pressed(winit::keyboard::KeyCode::Space) {
             self.cursor_locked = true;
             self.window
                 .set_cursor_grab(winit::window::CursorGrabMode::Locked)
@@ -1268,7 +1509,7 @@ impl App {
                 })
                 .unwrap();
             self.window.set_cursor_visible(false);
-        } else if self.cursor_locked && self.input.key_down(winit::keyboard::KeyCode::Space) {
+        } else if self.cursor_locked && self.input.key_pressed(winit::keyboard::KeyCode::Space) {
             self.cursor_locked = false;
 
             self.window
@@ -1276,12 +1517,14 @@ impl App {
                 .unwrap();
             self.window.set_cursor_visible(true);
         }
+
         self.camera.update(
             glam::uvec2(size.width, size.height),
             &delta_time,
             &self.input,
             self.cursor_locked,
         );
+
         self.input.update();
 
         unsafe {
@@ -1310,6 +1553,15 @@ impl App {
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
                 .unwrap();
+
+            self.device
+                .cmd_reset_query_pool(cb, self.query_pool, query_base, QUERY_COUNT);
+            self.device.cmd_write_timestamp2(
+                cb,
+                vk::PipelineStageFlags2::TOP_OF_PIPE,
+                self.query_pool,
+                query_base,
+            );
 
             self.device.cmd_pipeline_barrier2(
                 cb,
@@ -1437,7 +1689,38 @@ impl App {
                 self.device
                     .cmd_draw_indexed(cb, self.scene.index_counts[i], 1, 0, 0, 0);
             }
+
+            self.imgui_platform
+                .prepare_frame(self.imgui.io_mut(), &self.window)
+                .unwrap();
+            let ui = self.imgui.frame();
+            ui.window("Debug")
+                .size([300.0, 200.0], imgui::Condition::FirstUseEver)
+                .position([0.0, 0.0], imgui::Condition::FirstUseEver)
+                .build(|| {
+                    ui.text(format!("Resolution: {} x {}", size.width, size.height));
+                    ui.text(format!(
+                        "FPS: {:.1}",
+                        1.0 / self.avg_delta_time.as_secs_f64()
+                    ));
+                    ui.separator();
+                    ui.text(format!("Frame Time: {:#?}", self.avg_delta_time,));
+                    ui.text(format!("GPU Time: {:#?}", self.avg_gpu_time,));
+                });
+            self.imgui_platform.prepare_render(&ui, &self.window);
+            self.imgui_renderer
+                .cmd_draw(cb, imgui::Context::render(&mut self.imgui))
+                .unwrap();
+
             self.device.cmd_end_rendering(cb);
+
+            self.device.cmd_write_timestamp2(
+                cb,
+                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                self.query_pool,
+                query_base + 1,
+            );
+
             self.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
@@ -1492,15 +1775,15 @@ impl App {
             }
             self.window.pre_present_notify();
 
-            const FRAME_ACC_ALPHA: f64 = 1.0 / 120.0;
             self.avg_delta_time = self.avg_delta_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
                 + delta_time.mul_f64(FRAME_ACC_ALPHA);
             self.frame_id = self.frame_id.wrapping_add(1);
 
             if self.prev_fixed_time.elapsed().as_secs_f32() >= 1.0 {
                 self.prev_fixed_time = time;
-                println!("frame time: {:#?}", self.avg_delta_time);
-                println!("FPS: {:.2}", 1.0 / self.avg_delta_time.as_secs_f64());
+                // tick
+                // println!("frame time: {:#?}", self.avg_delta_time);
+                // println!("FPS: {:.2}", 1.0 / self.avg_delta_time.as_secs_f64());
             }
         };
     }
@@ -1547,7 +1830,7 @@ impl App {
                         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                         .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
                         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                        .present_mode(vk::PresentModeKHR::FIFO)
+                        .present_mode(vk::PresentModeKHR::IMMEDIATE)
                         .old_swapchain(old_swapchain),
                     None,
                 )

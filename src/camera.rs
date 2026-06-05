@@ -48,6 +48,9 @@ impl Camera {
         )
         .as_dvec2();
         in_vec /= in_vec.length().max(1.0);
+        if !cursor_locked {
+            in_vec = glam::DVec2::ZERO;
+        }
 
         if cursor_locked {
             self.rotation.z -= input.mouse.delta.x * Self::MOUSE_SENSITIVITY;

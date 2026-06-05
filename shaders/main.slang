@@ -1,6 +1,9 @@
 
 [[vk::binding(0, 0)]]
-Sampler2D textures[];
+Texture2D textures[];
+
+[[vk::binding(1, 0)]]
+SamplerState samplers[];
 
 struct FrameData
 {
@@ -135,7 +138,7 @@ SurfaceProperties gather_surface(VertexOutput in, MaterialData material)
     if (material.base_color_texture >= 0)
     {
         let tex = textures[material.base_color_texture];
-        let color = tex.Sample(in.uv);
+        let color = tex.Sample(samplers[material.albedo_sampler_index], in.uv);
         res.alpha *= color.a;
         res.albedo *= color.rgb;
     }
@@ -145,7 +148,7 @@ SurfaceProperties gather_surface(VertexOutput in, MaterialData material)
     if (material.metallic_roughness_texture >= 0)
     {
         let tex = textures[material.metallic_roughness_texture];
-        let mr = tex.Sample(in.uv);
+        let mr = tex.Sample(samplers[material.metallic_roughness_sampler_index], in.uv);
         res.metallic *= mr.b;
         res.roughness *= mr.g;
     }
@@ -156,7 +159,7 @@ SurfaceProperties gather_surface(VertexOutput in, MaterialData material)
     if (material.normal_texture >= 0)
     {
         let tex = textures[material.normal_texture];
-        let ts_normal = normalize(tex.Sample(in.uv).rgb * 2.0 - 1.0);
+        let ts_normal = normalize(tex.Sample(samplers[material.normal_sampler_index], in.uv).rgb * 2.0 - 1.0);
 
         var tangent = normalize(in.tangent.xyz);
         tangent = normalize(tangent - res.normal * dot(res.normal, tangent));
