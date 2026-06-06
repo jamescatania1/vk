@@ -5,10 +5,14 @@ Texture2D textures[];
 [[vk::binding(1, 0)]]
 SamplerState samplers[];
 
+[[vk::binding(2, 0)]]
+Sampler2D shadowmap;
+
 struct FrameData
 {
     float4x4 view_proj;
     float3 camera_pos;
+    float4x4 sun_view_proj;
 };
 
 struct ObjectData
@@ -62,6 +66,7 @@ struct VertexOutput
     float4 tangent;
     float3 color;
     float2 uv;
+    float4 light_pos;
 };
 
 [shader("vertex")]
@@ -78,6 +83,7 @@ VertexOutput vertex(VertexInput input, uniform PushConstants data)
     res.normal = mul(object.normal_transform, input.normal);
     res.tangent = float4(normalize(mul((float3x3)object.transform, input.tangent.xyz)), input.tangent.w);
     res.uv = input.uv;
+    res.light_pos = mul(data.frame.sun_view_proj, world_pos);
     return res;
 }
 
@@ -87,11 +93,11 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     let material = data.materials[data.material_id];
     let surface = gather_surface(in, material);
 
-    if (surface.alpha < material.alpha_cutoff)
-    {
-        // discard;
-        return float4(0.0, 0.0, 0.0, 0.0);
-    }
+    // if (surface.alpha < material.alpha_cutoff)
+    // {
+    //     // discard;
+    //     return float4(0.0, 0.0, 0.0, 0.0);
+    // }
 
     float3 light_dir = normalize(float3(0.2, -0.1, 1.4));
     float3 view_dir = normalize(data.frame.camera_pos - in.world_pos);
@@ -116,9 +122,30 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     let direct = bsdf * float3(1.0) * 6.0 * ndl;
     let indirect = 0.5 * surface.albedo;
 
-    var res = direct + indirect;
+    let shadow = sample_shadow(in.light_pos);
+    if (shadow < 0.0)
+    {
+        return float4(1.0, 0.0, 0.0, 1.0);
+    }
+
+    var res = direct * shadow + indirect;
 
     return float4(res, surface.alpha);
+}
+
+float sample_shadow(float4 cs_light_pos)
+{
+    let ndc = cs_light_pos.xyz / cs_light_pos.w;
+    let uv = ndc.xy * 0.5 + 0.5;
+    let depth = ndc.z;
+    if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || depth < 0.0 || depth > 1.0)
+    {
+        return -1.0;
+    }
+    let shadow_depth = shadowmap.Sample(uv).r;
+
+    let bias = 0.001;
+    return depth <= shadow_depth + bias ? 1.0 : 0.0;
 }
 
 struct SurfaceProperties

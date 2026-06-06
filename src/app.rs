@@ -34,9 +34,9 @@ pub struct App {
     swapchain_image_views: Vec<vk::ImageView>,
     query_pool: vk::QueryPool,
 
-    depth_image: vk::Image,
-    depth_allocation: vk_mem::Allocation,
-    depth_view: vk::ImageView,
+    depth: (vk::Image, vk_mem::Allocation, vk::ImageView),
+    color_output: (vk::Image, vk_mem::Allocation, vk::ImageView),
+    shadowmap: (vk::Image, vk_mem::Allocation, vk::ImageView, vk::Sampler),
     scene: SceneResources,
     frame_data: Vec<(
         vk::Buffer,
@@ -51,6 +51,8 @@ pub struct App {
     avg_gpu_time: Duration,
     pub input: Input,
     camera: Camera,
+    sun_azimuth: f64,
+    sun_altitude: f64,
     pub cursor_locked: bool,
     pub recreate_swapchain: bool,
 
@@ -60,6 +62,8 @@ pub struct App {
 
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    shadow_pipeline_layout: vk::PipelineLayout,
+    shadow_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
@@ -94,6 +98,7 @@ struct PrimitiveIndices {
 pub struct FrameData {
     pub view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 3],
+    pub sun_view_proj: [[f32; 4]; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
@@ -146,9 +151,11 @@ struct VertexData {
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 const QUERY_COUNT: u32 = 2;
 const FRAME_ACC_ALPHA: f64 = 1.0 / 30.0;
+const ANISOTROPIC_SAMPLES: f32 = 16.0;
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
-const ANISOTROPIC_SAMPLES: f32 = 16.0;
+const SHADOWMAP_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
+const SHADOWMAP_SIZE: u32 = 2048;
 
 impl SceneResources {
     fn create(
@@ -380,26 +387,35 @@ impl SceneResources {
 
         let mut images = Vec::new();
         for (i, img) in textures.iter().enumerate() {
-            let (format, pixels) = match (img.format, images_srgb[i]) {
-                (gltf::image::Format::R8G8B8A8, true) => {
-                    (vk::Format::R8G8B8A8_SRGB, img.pixels.clone())
-                }
-                (gltf::image::Format::R8G8B8A8, false) => {
-                    (vk::Format::R8G8B8A8_UNORM, img.pixels.clone())
-                }
-                (gltf::image::Format::R8G8B8, srgb) => {
-                    let mut pixels = Vec::new();
+            let format = if images_srgb[i] {
+                vk::Format::R8G8B8A8_SRGB
+            } else {
+                vk::Format::R8G8B8A8_UNORM
+            };
+            let pixels = match img.format {
+                gltf::image::Format::R8G8B8A8 => img.pixels.clone(),
+                gltf::image::Format::R8G8B8 => {
+                    let mut pixels = Vec::with_capacity(img.pixels.len() * 4 / 3);
                     for rgb in img.pixels.as_chunks::<3>().0 {
                         pixels.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
                     }
-                    let format = if srgb {
-                        vk::Format::R8G8B8A8_SRGB
-                    } else {
-                        vk::Format::R8G8B8A8_UNORM
-                    };
-                    (format, pixels)
+                    pixels
                 }
-                (f, _) => panic!("bad format {:#?}", f),
+                gltf::image::Format::R8G8 => {
+                    let mut pixels = Vec::with_capacity(img.pixels.len() * 2);
+                    for rg in img.pixels.as_chunks::<2>().0 {
+                        pixels.extend_from_slice(&[rg[0], rg[1], 0, 255]);
+                    }
+                    pixels
+                }
+                gltf::image::Format::R8 => {
+                    let mut pixels = Vec::with_capacity(img.pixels.len() * 4);
+                    for r in img.pixels.iter() {
+                        pixels.extend_from_slice(&[*r, 0, 0, 255]);
+                    }
+                    pixels
+                }
+                f => panic!("bad format {:#?}", f),
             };
             let mip_levels = img.width.max(img.height).ilog2() + 1;
             let (image, allocation) = unsafe {
@@ -1012,8 +1028,8 @@ impl App {
             (swapchain, images, views)
         };
 
-        let (depth_image, depth_allocation) = unsafe {
-            allocator
+        let depth = unsafe {
+            let (image, allocation) = allocator
                 .create_image(
                     &vk::ImageCreateInfo::default()
                         .image_type(vk::ImageType::TYPE_2D)
@@ -1031,13 +1047,11 @@ impl App {
                         ..Default::default()
                     },
                 )
-                .unwrap()
-        };
-        let depth_view = unsafe {
-            device
+                .unwrap();
+            let view = device
                 .create_image_view(
                     &vk::ImageViewCreateInfo {
-                        image: depth_image,
+                        image,
                         view_type: vk::ImageViewType::TYPE_2D,
                         format: DEPTH_FORMAT,
                         subresource_range: vk::ImageSubresourceRange::default()
@@ -1048,7 +1062,102 @@ impl App {
                     },
                     None,
                 )
-                .unwrap()
+                .unwrap();
+            (image, allocation, view)
+        };
+
+        let color_output = unsafe {
+            let (image, allocation) = allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R16G16B16A16_SFLOAT)
+                        .extent(surface_capabilities.current_extent.into())
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                        usage: vk_mem::MemoryUsage::Auto,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format: vk::Format::R16G16B16A16_SFLOAT,
+                        subresource_range: vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            (image, allocation, view)
+        };
+
+        let shadowmap = unsafe {
+            let (image, allocation) = allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(SHADOWMAP_FORMAT)
+                        .extent(vk::Extent3D {
+                            width: SHADOWMAP_SIZE,
+                            height: SHADOWMAP_SIZE,
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(
+                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                                | vk::ImageUsageFlags::SAMPLED,
+                        )
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                        usage: vk_mem::MemoryUsage::Auto,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format: SHADOWMAP_FORMAT,
+                        subresource_range: vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            let sampler = device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+                        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+                        .anisotropy_enable(false)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST),
+                    None,
+                )
+                .unwrap();
+            (image, allocation, view, sampler)
         };
 
         let mut render_complete_semaphores = Vec::new();
@@ -1139,6 +1248,9 @@ impl App {
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::SAMPLER)
                                 .descriptor_count(scene.samplers.len() as u32),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1),
                         ]),
                     None,
                 )
@@ -1157,6 +1269,11 @@ impl App {
                             .binding(1)
                             .descriptor_type(vk::DescriptorType::SAMPLER)
                             .descriptor_count(scene.samplers.len() as u32)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(2)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
                             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
                     ]),
                     None,
@@ -1186,6 +1303,10 @@ impl App {
             .iter()
             .map(|sampler| vk::DescriptorImageInfo::default().sampler(*sampler))
             .collect::<Vec<_>>();
+        let shadowmap_info = vk::DescriptorImageInfo::default()
+            .image_view(shadowmap.2)
+            .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
+            .sampler(shadowmap.3);
         unsafe {
             device.update_descriptor_sets(
                 &[
@@ -1201,6 +1322,12 @@ impl App {
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
                         .image_info(&sampler_infos),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(2)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .image_info(&[shadowmap_info]),
                 ],
                 &[],
             )
@@ -1357,7 +1484,8 @@ impl App {
                         )
                         .rasterization_state(
                             &vk::PipelineRasterizationStateCreateInfo::default()
-                                .cull_mode(vk::CullModeFlags::BACK),
+                                .cull_mode(vk::CullModeFlags::BACK)
+                                .line_width(1.0),
                         )
                         .multisample_state(
                             &vk::PipelineMultisampleStateCreateInfo::default()
@@ -1386,11 +1514,133 @@ impl App {
                 .unwrap()[0]
         };
 
+        let shader_shadow_vertex = unsafe {
+            device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&shaders.shadow.vertex),
+                    None,
+                )
+                .unwrap()
+        };
+        let shader_shadow_fragment = unsafe {
+            device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&shaders.shadow.fragment),
+                    None,
+                )
+                .unwrap()
+        };
+
+        let shadow_pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
+                        vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::VERTEX)
+                            .size(std::mem::size_of::<PushConstants>() as u32),
+                    ]),
+                    None,
+                )
+                .unwrap()
+        };
+
+        let shadow_pipeline = unsafe {
+            device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::GraphicsPipelineCreateInfo::default()
+                        .push_next(
+                            &mut vk::PipelineRenderingCreateInfo::default()
+                                .color_attachment_formats(&[])
+                                .depth_attachment_format(SHADOWMAP_FORMAT),
+                        )
+                        .stages(&[
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::VERTEX)
+                                .name(&CString::new("main").unwrap())
+                                .module(shader_shadow_vertex),
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::FRAGMENT)
+                                .name(&CString::new("main").unwrap())
+                                .module(shader_shadow_fragment),
+                        ])
+                        .vertex_input_state(
+                            &vk::PipelineVertexInputStateCreateInfo::default()
+                                .vertex_binding_descriptions(&[
+                                    vk::VertexInputBindingDescription::default()
+                                        .binding(0)
+                                        .stride(std::mem::size_of::<VertexData>() as u32)
+                                        .input_rate(vk::VertexInputRate::VERTEX),
+                                ])
+                                .vertex_attribute_descriptions(&[
+                                    vk::VertexInputAttributeDescription::default()
+                                        .location(0)
+                                        .binding(0)
+                                        .format(vk::Format::R32G32B32_SFLOAT)
+                                        .offset(std::mem::offset_of!(VertexData, position) as u32),
+                                    vk::VertexInputAttributeDescription::default()
+                                        .location(1)
+                                        .binding(0)
+                                        .format(vk::Format::R32G32B32_SFLOAT)
+                                        .offset(std::mem::offset_of!(VertexData, normal) as u32),
+                                    vk::VertexInputAttributeDescription::default()
+                                        .location(2)
+                                        .binding(0)
+                                        .format(vk::Format::R32G32B32A32_SFLOAT)
+                                        .offset(std::mem::offset_of!(VertexData, tangent) as u32),
+                                    vk::VertexInputAttributeDescription::default()
+                                        .location(3)
+                                        .binding(0)
+                                        .format(vk::Format::R32G32B32_SFLOAT)
+                                        .offset(std::mem::offset_of!(VertexData, color) as u32),
+                                    vk::VertexInputAttributeDescription::default()
+                                        .location(4)
+                                        .binding(0)
+                                        .format(vk::Format::R32G32_SFLOAT)
+                                        .offset(std::mem::offset_of!(VertexData, uv) as u32),
+                                ]),
+                        )
+                        .input_assembly_state(
+                            &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+                        )
+                        .viewport_state(
+                            &vk::PipelineViewportStateCreateInfo::default()
+                                .viewport_count(1)
+                                .scissor_count(1),
+                        )
+                        .rasterization_state(
+                            &vk::PipelineRasterizationStateCreateInfo::default()
+                                .cull_mode(vk::CullModeFlags::BACK)
+                                .line_width(1.0),
+                        )
+                        .multisample_state(
+                            &vk::PipelineMultisampleStateCreateInfo::default()
+                                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                        )
+                        .depth_stencil_state(
+                            &vk::PipelineDepthStencilStateCreateInfo::default()
+                                .depth_test_enable(true)
+                                .depth_write_enable(true)
+                                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL),
+                        )
+                        .color_blend_state(&vk::PipelineColorBlendStateCreateInfo::default())
+                        .dynamic_state(
+                            &vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+                                vk::DynamicState::VIEWPORT,
+                                vk::DynamicState::SCISSOR,
+                            ]),
+                        )
+                        .layout(shadow_pipeline_layout)],
+                    None,
+                )
+                .unwrap()[0]
+        };
+
         Self {
             entry,
             window,
             allocator,
-            depth_view,
             instance,
             surface_loader,
             surface,
@@ -1402,8 +1652,9 @@ impl App {
             swapchain,
             swapchain_images,
             swapchain_image_views,
-            depth_image,
-            depth_allocation,
+            depth,
+            color_output,
+            shadowmap,
             frame_data,
             scene,
             frame_id: 0,
@@ -1413,10 +1664,14 @@ impl App {
             avg_gpu_time: Duration::ZERO,
             input: Default::default(),
             camera: Camera::new(),
+            sun_azimuth: 45.0,
+            sun_altitude: 45.0,
             cursor_locked: false,
             recreate_swapchain: false,
             pipeline_layout,
             pipeline,
+            shadow_pipeline_layout,
+            shadow_pipeline,
             imgui,
             imgui_platform,
             imgui_renderer,
@@ -1446,27 +1701,29 @@ impl App {
 
         let query_base = self.frame_index as u32 * QUERY_COUNT;
 
-        let mut timestamps = [0u64; QUERY_COUNT as usize];
-        unsafe {
-            match self.device.get_query_pool_results(
-                self.query_pool,
-                query_base,
-                &mut timestamps,
-                vk::QueryResultFlags::TYPE_64,
-            ) {
-                Ok(()) => {
-                    let delta = Duration::from_nanos(
-                        (timestamps[1].wrapping_sub(timestamps[0]) as f64
-                            * self.physical_device_properties.limits.timestamp_period as f64)
-                            as u64,
-                    );
-                    self.avg_gpu_time = self.avg_gpu_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
-                        + delta.mul_f64(FRAME_ACC_ALPHA);
+        if self.frame_id >= MAX_FRAMES_IN_FLIGHT as u64 {
+            let mut timestamps = [0u64; QUERY_COUNT as usize];
+            unsafe {
+                match self.device.get_query_pool_results(
+                    self.query_pool,
+                    query_base,
+                    &mut timestamps,
+                    vk::QueryResultFlags::TYPE_64,
+                ) {
+                    Ok(()) => {
+                        let delta = Duration::from_nanos(
+                            (timestamps[1].wrapping_sub(timestamps[0]) as f64
+                                * self.physical_device_properties.limits.timestamp_period as f64)
+                                as u64,
+                        );
+                        self.avg_gpu_time = self.avg_gpu_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
+                            + delta.mul_f64(FRAME_ACC_ALPHA);
+                    }
+                    Err(vk::Result::NOT_READY) => {}
+                    Err(err) => panic!("{err:?}"),
                 }
-                Err(vk::Result::NOT_READY) => {}
-                Err(err) => panic!("{err:?}"),
-            }
-        };
+            };
+        }
 
         if self.recreate_swapchain {
             self.recreate_swapchain();
@@ -1531,6 +1788,29 @@ impl App {
             let mapped = self.frame_data[self.frame_index].2;
             (*mapped).view_proj = self.camera.view_proj.to_cols_array_2d();
             (*mapped).camera_pos = self.camera.position.as_vec3().to_array();
+
+            let az = self.sun_azimuth.to_radians() as f32;
+            let alt = self.sun_altitude.to_radians() as f32;
+            let sun_dir =
+                glam::vec3(alt.cos() * az.sin(), alt.cos() * az.cos(), alt.sin()).normalize();
+
+            const SHADOW_RADIUS: f32 = 20.0;
+            let center =
+                self.camera.position.as_vec3() + self.camera.forward.as_vec3() * SHADOW_RADIUS;
+            let light_pos = center + sun_dir * 200.0;
+
+            let sun_view = glam::Mat4::look_at_rh(light_pos, center, glam::Vec3::Z);
+
+            let sun_proj = glam::Mat4::orthographic_rh(
+                -SHADOW_RADIUS,
+                SHADOW_RADIUS,
+                -SHADOW_RADIUS,
+                SHADOW_RADIUS,
+                0.0,
+                400.0,
+            );
+            let sun_view_proj = sun_proj * sun_view;
+            (*mapped).sun_view_proj = sun_view_proj.to_cols_array_2d();
         }
         self.allocator
             .flush_allocation(
@@ -1567,6 +1847,125 @@ impl App {
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .dst_stage_mask(
+                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                        )
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .image(self.shadowmap.0)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                ]),
+            );
+
+            self.device.cmd_begin_rendering(
+                cb,
+                &vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D::default().extent(vk::Extent2D {
+                        width: SHADOWMAP_SIZE,
+                        height: SHADOWMAP_SIZE,
+                    }))
+                    .layer_count(1)
+                    .color_attachments(&[])
+                    .depth_attachment(
+                        &vk::RenderingAttachmentInfo::default()
+                            .image_view(self.shadowmap.2)
+                            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            }),
+                    ),
+            );
+            self.device.cmd_set_viewport(
+                cb,
+                0,
+                &[vk::Viewport {
+                    width: SHADOWMAP_SIZE as f32,
+                    height: SHADOWMAP_SIZE as f32,
+                    x: 0.0,
+                    y: 0.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(
+                cb,
+                0,
+                &[vk::Rect2D {
+                    extent: vk::Extent2D {
+                        width: SHADOWMAP_SIZE,
+                        height: SHADOWMAP_SIZE,
+                    },
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                }],
+            );
+            self.device.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.shadow_pipeline,
+            );
+            for i in 0..self.scene.vertex_buffers.len() {
+                self.device
+                    .cmd_bind_vertex_buffers(cb, 0, &[self.scene.vertex_buffers[i].0], &[0]);
+                self.device.cmd_bind_index_buffer(
+                    cb,
+                    self.scene.index_buffers[i].0,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.device.cmd_push_constants(
+                    cb,
+                    self.shadow_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(&PushConstants {
+                        frame_ptr: self.frame_data[self.frame_index].3,
+                        objects_ptr: self.scene.object_buffer.2,
+                        materials_ptr: self.scene.material_buffer.2,
+                        object_id: self.scene.primitive_indices[i].object_id,
+                        material_id: self.scene.primitive_indices[i].material_id,
+                    }),
+                );
+                self.device
+                    .cmd_draw_indexed(cb, self.scene.index_counts[i], 1, 0, 0, 0);
+            }
+
+            self.device.cmd_end_rendering(cb);
+
+            self.device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(
+                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                        )
+                        .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)
+                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
+                        .image(self.shadowmap.0)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                         .src_access_mask(vk::AccessFlags2::empty())
                         .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
@@ -1590,7 +1989,7 @@ impl App {
                         .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                        .image(self.depth_image)
+                        .image(self.depth.0)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1619,7 +2018,7 @@ impl App {
                         })])
                     .depth_attachment(
                         &vk::RenderingAttachmentInfo::default()
-                            .image_view(self.depth_view)
+                            .image_view(self.depth.2)
                             .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                             .load_op(vk::AttachmentLoadOp::CLEAR)
                             .store_op(vk::AttachmentStoreOp::DONT_CARE)
@@ -1706,6 +2105,9 @@ impl App {
                     ui.separator();
                     ui.text(format!("Frame Time: {:#?}", self.avg_delta_time,));
                     ui.text(format!("GPU Time: {:#?}", self.avg_gpu_time,));
+                    ui.separator();
+                    ui.slider("Sun Azimuth", 0.0, 360.0, &mut self.sun_azimuth);
+                    ui.slider("Sun Altitude", 0.0, 90.0, &mut self.sun_altitude);
                 });
             self.imgui_platform.prepare_render(&ui, &self.window);
             self.imgui_renderer
@@ -1806,9 +2208,13 @@ impl App {
             unsafe { self.device.destroy_image_view(view, None) };
         }
         unsafe {
-            self.device.destroy_image_view(self.depth_view, None);
+            self.device.destroy_image_view(self.depth.2, None);
             self.allocator
-                .destroy_image(self.depth_image, &mut self.depth_allocation);
+                .destroy_image(self.depth.0, &mut self.depth.1);
+
+            self.device.destroy_image_view(self.color_output.2, None);
+            self.allocator
+                .destroy_image(self.color_output.0, &mut self.color_output.1);
         }
 
         let surface_capabilities = unsafe {
@@ -1866,8 +2272,9 @@ impl App {
             })
             .collect::<Vec<_>>();
 
-        (self.depth_image, self.depth_allocation) = unsafe {
-            self.allocator
+        self.depth = unsafe {
+            let (image, allocation) = self
+                .allocator
                 .create_image(
                     &vk::ImageCreateInfo::default()
                         .image_type(vk::ImageType::TYPE_2D)
@@ -1885,13 +2292,12 @@ impl App {
                         ..Default::default()
                     },
                 )
-                .unwrap()
-        };
-        self.depth_view = unsafe {
-            self.device
+                .unwrap();
+            let view = self
+                .device
                 .create_image_view(
                     &vk::ImageViewCreateInfo {
-                        image: self.depth_image,
+                        image: image,
                         view_type: vk::ImageViewType::TYPE_2D,
                         format: DEPTH_FORMAT,
                         subresource_range: vk::ImageSubresourceRange::default()
@@ -1902,7 +2308,48 @@ impl App {
                     },
                     None,
                 )
-                .unwrap()
+                .unwrap();
+            (image, allocation, view)
+        };
+
+        self.color_output = unsafe {
+            let (image, allocation) = self
+                .allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R16G16B16A16_SFLOAT)
+                        .extent(surface_capabilities.current_extent.into())
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                        usage: vk_mem::MemoryUsage::Auto,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let view = self
+                .device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format: vk::Format::R16G16B16A16_SFLOAT,
+                        subresource_range: vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            (image, allocation, view)
         };
 
         self.render_complete_semaphores = Vec::new();
@@ -1920,9 +2367,9 @@ impl Drop for App {
     fn drop(&mut self) {
         unsafe {
             self.device.device_wait_idle().unwrap();
-            self.device.destroy_image_view(self.depth_view, None);
-            self.allocator
-                .destroy_image(self.depth_image, &mut self.depth_allocation);
+            // self.device.destroy_image_view(self.depth_view, None);
+            // self.allocator
+            //     .destroy_image(self.depth_image, &mut self.depth_allocation);
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None);
 

@@ -11,6 +11,7 @@ use crate::input::Input;
 #[derive(Debug)]
 pub struct Camera {
     pub position: DVec3,
+    pub forward: DVec3,
     pub view_proj: Mat4,
     velocity: DVec3,
     rotation: DVec3,
@@ -26,6 +27,7 @@ impl Camera {
     pub fn new() -> Self {
         Self {
             position: dvec3(-2.0, -2.0, 0.5),
+            forward: dvec3(1.0, 0.0, 0.0),
             velocity: DVec3::ZERO,
             rotation: DVec3::ZERO,
             fov: 90.0f64.to_radians(),
@@ -60,20 +62,20 @@ impl Camera {
                 .x
                 .clamp(-PI / 2.0 + EPSILON, PI / 2.0 - EPSILON);
         }
-        let forward = dvec3(
+        self.forward = dvec3(
             self.rotation.z.cos() * self.rotation.x.cos(),
             self.rotation.z.sin() * self.rotation.x.cos(),
             self.rotation.x.sin(),
         )
         .normalize();
-        let right = -Self::UP.cross(forward);
+        let right = -Self::UP.cross(self.forward);
 
-        let targ_velocity = in_vec.x * right + in_vec.y * forward;
+        let targ_velocity = in_vec.x * right + in_vec.y * self.forward;
         let delta_ms = (delta_time.as_secs_f64() * 1000.0).clamp(0.1, 1000.0);
         self.velocity = self.velocity.lerp(targ_velocity, delta_ms * 0.01);
         self.position += self.velocity * (delta_ms * 0.005);
 
-        let view = DMat4::look_at_rh(self.position, self.position + forward, Self::UP);
+        let view = DMat4::look_at_rh(self.position, self.position + self.forward, Self::UP);
         let mut proj = DMat4::perspective_rh(
             self.fov,
             size.x as f64 / size.y.max(1) as f64,
