@@ -7,15 +7,17 @@ use winit::{
     window::{Window, WindowId},
 };
 
-mod app;
 mod camera;
 mod input;
-use app::App;
+mod renderer;
+mod scene;
+mod screen;
+use renderer::Renderer;
 
 include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
 
 struct Program {
-    app: Option<App>,
+    app: Option<Renderer>,
 }
 
 impl ApplicationHandler for Program {
@@ -28,7 +30,7 @@ impl ApplicationHandler for Program {
             .with_inner_size(LogicalSize::new(1920.0, 1080.0))
             .with_title("vulkan");
         let window = event_loop.create_window(cfg).unwrap();
-        self.app = Some(App::new(window));
+        self.app = Some(Renderer::new(window));
         self.app.as_ref().unwrap().window.request_redraw();
     }
 
@@ -79,7 +81,7 @@ impl ApplicationHandler for Program {
                 }
             }
             WindowEvent::Resized(_) => {
-                app.recreate_swapchain = true;
+                app.on_resize();
             }
             _ => {}
         };
@@ -111,7 +113,6 @@ impl ApplicationHandler for Program {
         let Some(app) = &mut self.app else {
             return;
         };
-        // app.about_to_wait(event_loop);
     }
 }
 

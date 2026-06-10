@@ -1,4 +1,6 @@
 
+static const uint CASCADES = 3;
+
 [[vk::binding(0, 0)]]
 Texture2D textures[];
 
@@ -6,13 +8,23 @@ Texture2D textures[];
 SamplerState samplers[];
 
 [[vk::binding(2, 0)]]
-Sampler2D shadowmap;
+Sampler2D shadowmaps[CASCADES];
 
 struct FrameData
 {
     float4x4 view_proj;
+    float4x4 view;
+    float4x4 proj;
     float3 camera_pos;
-    float4x4 sun_view_proj;
+    float3 light_dir;
+    Cascade cascades[CASCADES];
+};
+
+struct Cascade
+{
+    float4x4 view_proj;
+    float near;
+    float far;
 };
 
 struct ObjectData
@@ -66,7 +78,6 @@ struct VertexOutput
     float4 tangent;
     float3 color;
     float2 uv;
-    float4 light_pos;
 };
 
 [shader("vertex")]
@@ -83,7 +94,6 @@ VertexOutput vertex(VertexInput input, uniform PushConstants data)
     res.normal = mul(object.normal_transform, input.normal);
     res.tangent = float4(normalize(mul((float3x3)object.transform, input.tangent.xyz)), input.tangent.w);
     res.uv = input.uv;
-    res.light_pos = mul(data.frame.sun_view_proj, world_pos);
     return res;
 }
 
@@ -93,20 +103,18 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     let material = data.materials[data.material_id];
     let surface = gather_surface(in, material);
 
-    // if (surface.alpha < material.alpha_cutoff)
-    // {
-    //     // discard;
-    //     return float4(0.0, 0.0, 0.0, 0.0);
-    // }
+    if (surface.alpha < material.alpha_cutoff)
+    {
+        discard;
+    }
 
-    float3 light_dir = normalize(float3(0.2, -0.1, 1.4));
     float3 view_dir = normalize(data.frame.camera_pos - in.world_pos);
-    float3 half_dir = normalize(view_dir + light_dir);
+    float3 half_dir = normalize(view_dir + data.frame.light_dir);
 
     let ndh = max(dot(surface.normal, half_dir), 0.0);
     let vdh = max(dot(view_dir, half_dir), 0.0);
     let ndv = max(dot(surface.normal, view_dir), 0.0);
-    let ndl = max(dot(surface.normal, light_dir), 0.0);
+    let ndl = max(dot(surface.normal, data.frame.light_dir), 0.0);
 
     let f0 = lerp(float3(0.04), surface.albedo, surface.metallic);
     let ks = fresnel(f0, vdh);
@@ -122,29 +130,56 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     let direct = bsdf * float3(1.0) * 6.0 * ndl;
     let indirect = 0.5 * surface.albedo;
 
-    let shadow = sample_shadow(in.light_pos);
-    if (shadow < 0.0)
+    let view_pos = mul(data.frame.view, float4(in.world_pos, 1.0));
+    let depth = abs(view_pos.z);
+
+    var shadow = 0.0;
+    // var sampled_cascade = false;
+    var cascade_index = CASCADES - 1;
+    for (int i = 0; i < CASCADES; i++)
     {
-        return float4(1.0, 0.0, 0.0, 1.0);
+        let cascade = &data.frame.cascades[i];
+        if (depth < cascade.far && depth > cascade.near)
+        {
+            let cascade_shadow = sample_shadow(in.world_pos, cascade, i);
+
+            shadow += cascade_shadow;
+            cascade_index = i;
+            break;
+            // if (sampled_cascade)
+            // {
+            //     let blend_factor = (depth - cascade.near) / (data.frame.cascades[i - 1].far - cascade.near);
+            //     shadow = shadow * blend_factor + cascade_shadow * (1.0 - blend_factor);
+            //     break;
+            // }
+            // else
+            // {
+            //     shadow += cascade_shadow;
+            // }
+            // sampled_cascade = true;
+        }
     }
 
     var res = direct * shadow + indirect;
+    // var res = float3(shadow);
+    // res[cascade_index] *= 0.8;
 
     return float4(res, surface.alpha);
 }
 
-float sample_shadow(float4 cs_light_pos)
+float sample_shadow(float3 world_pos, Cascade *cascade, int cascade_index)
 {
-    let ndc = cs_light_pos.xyz / cs_light_pos.w;
+    let light_pos = mul(cascade.view_proj, float4(world_pos, 1.0));
+    let ndc = light_pos.xyz / light_pos.w;
     let uv = ndc.xy * 0.5 + 0.5;
     let depth = ndc.z;
     if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || depth < 0.0 || depth > 1.0)
     {
-        return -1.0;
+        return 0.0;
     }
-    let shadow_depth = shadowmap.Sample(uv).r;
+    let shadow_depth = shadowmaps[cascade_index].Sample(uv).r;
 
-    let bias = 0.001;
+    let bias = 0.002;
     return depth <= shadow_depth + bias ? 1.0 : 0.0;
 }
 

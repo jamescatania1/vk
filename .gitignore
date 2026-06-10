@@ -1,4 +1,5 @@
 /target
 
-assets/san_miguel.glb
-assets/bistro.glb
+assets/*.glb
+!assets/suzanne.glb
+!assets/sponza.glb

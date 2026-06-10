@@ -1,8 +1,20 @@
+static const uint CASCADES = 3;
+
 struct FrameData
 {
     float4x4 view_proj;
+    float4x4 view;
+    float4x4 proj;
     float3 camera_pos;
-    float4x4 sun_view_proj;
+    float3 light_dir;
+    Cascade cascades[CASCADES];
+};
+
+struct Cascade
+{
+    float4x4 view_proj;
+    float near;
+    float far;
 };
 
 struct ObjectData
@@ -37,6 +49,8 @@ struct PushConstants
     MaterialData *materials;
     uint object_id;
     uint material_id;
+    uint cascade_index;
+    uint _pad;
 };
 
 struct VertexInput
@@ -61,7 +75,7 @@ VertexOutput vertex(VertexInput input, uniform PushConstants data)
     let object = data.objects[data.object_id];
     let world_pos = mul(object.transform, float4(input.position, 1.0));
 
-    res.position = mul(data.frame.sun_view_proj, world_pos);
+    res.position = mul(data.frame.cascades[data.cascade_index].view_proj, world_pos);
     return res;
 }
 

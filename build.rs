@@ -113,10 +113,10 @@ fn main() {
         let def = quote::quote! {
             #[derive(Debug)]
             pub struct #module_type_ident {
-                #(pub #entry_field_defs: Vec<u32>,)*
+                #(pub #entry_field_defs: vk::ShaderModule,)*
             }
             impl CreateModule for #module_type_ident {
-                fn new() -> Self {
+                fn new(device: &ash::Device) -> Self {
                     Self {
                         #(
                             #entry_field_inits: {
@@ -129,7 +129,14 @@ fn main() {
                                     .chunks_exact(4)
                                     .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                                     .collect();
-                                src
+                                unsafe {
+                                    device
+                                        .create_shader_module(
+                                            &vk::ShaderModuleCreateInfo::default().code(&src),
+                                            None,
+                                        )
+                                        .unwrap()
+                                }
                             },
                         )*
                     }
@@ -151,10 +158,12 @@ fn main() {
 
     let code = quote::quote! {
         pub mod shaders {
+            use ash::vk::{self};
+
             #(#module_defs)*
 
             pub trait CreateModule: Sized {
-                fn new() -> Self;
+                fn new(device: &ash::Device) -> Self;
             }
 
             #[derive(Debug)]
@@ -165,10 +174,10 @@ fn main() {
             }
 
             impl Shaders {
-                pub fn new() -> Self {
+                pub fn new(device: &ash::Device) -> Self {
                     Self {
                         #(
-                            #module_field_inits: #module_type_inits::new(),
+                            #module_field_inits: #module_type_inits::new(device),
                         )*
                     }
                 }
