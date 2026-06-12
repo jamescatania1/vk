@@ -58,6 +58,8 @@ pub struct Renderer {
     camera: Camera,
     sun_azimuth: f64,
     sun_altitude: f64,
+    debug_view: u32,
+    cascade_lambda: f32,
     pub cursor_locked: bool,
 
     pub imgui: imgui::Context,
@@ -95,6 +97,7 @@ pub struct FrameData {
 #[repr(C)]
 pub struct Cascade {
     pub view_proj: [[f32; 4]; 4],
+    pub texel_size: [f32; 2],
     pub near: f32,
     pub far: f32,
 }
@@ -121,13 +124,21 @@ pub struct ShadowPushConstants {
     pub _pad: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, Zeroable, Pod)]
+#[repr(C)]
+pub struct PostfxPushConstants {
+    pub frame_ptr: vk::DeviceAddress,
+    pub debug_view: u32,
+    pub _pad: u32,
+}
+
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 const QUERY_COUNT: u32 = 2;
 const FRAME_ACC_ALPHA: f64 = 1.0 / 30.0;
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 const SHADOWMAP_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
-const SHADOWMAP_SIZE: u32 = 2048;
+pub const SHADOWMAP_SIZE: u32 = 2048;
 
 impl Renderer {
     pub fn new(window: Window) -> Self {
@@ -243,6 +254,9 @@ impl Renderer {
         device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
         if has_device_extension(ash::khr::portability_subset::NAME) {
             device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+        if has_device_extension(ash::khr::dynamic_rendering_local_read::NAME) {
+            device_extensions.push(ash::khr::dynamic_rendering_local_read::NAME.as_ptr());
         }
 
         let vk_10_features = vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
@@ -732,7 +746,9 @@ impl Renderer {
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
                         vk::PushConstantRange::default()
-                            .stage_flags(vk::ShaderStageFlags::VERTEX)
+                            .stage_flags(
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            )
                             .size(std::mem::size_of::<ShadowPushConstants>() as u32),
                     ]),
                     None,
@@ -817,7 +833,13 @@ impl Renderer {
         let postfx_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[descriptor_set_layout]),
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .push_constant_ranges(&[vk::PushConstantRange::default()
+                            .stage_flags(
+                                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                            )
+                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                        .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
                 .unwrap()
@@ -901,6 +923,8 @@ impl Renderer {
             camera: Camera::new(),
             sun_azimuth: 45.0,
             sun_altitude: 80.0,
+            debug_view: 0,
+            cascade_lambda: 0.8,
             cursor_locked: false,
             pipeline_layout,
             pipeline,
@@ -989,7 +1013,7 @@ impl Renderer {
                     return;
                 }
                 Err(err) => {
-                    panic!("{err}");
+                    panic!("{err:?}");
                 }
             }
         };
@@ -1032,6 +1056,8 @@ impl Renderer {
             &self.input,
             self.cursor_locked,
             sun_dir,
+            self.cascade_lambda,
+            &self.scene,
         );
 
         self.input.update();
@@ -1048,6 +1074,7 @@ impl Renderer {
                 (*mapped).cascades[i] = Cascade {
                     near: cascade.near,
                     far: cascade.far,
+                    texel_size: cascade.texel_size.to_array(),
                     view_proj: cascade.view_proj.to_cols_array_2d(),
                 };
             }
@@ -1179,7 +1206,7 @@ impl Renderer {
                     self.device.cmd_push_constants(
                         cb,
                         self.shadow_pipeline_layout,
-                        vk::ShaderStageFlags::VERTEX,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                         0,
                         bytemuck::bytes_of(&ShadowPushConstants {
                             frame_ptr,
@@ -1434,6 +1461,17 @@ impl Renderer {
                 &[self.descriptor_set],
                 &[],
             );
+            self.device.cmd_push_constants(
+                cb,
+                self.postfx_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytemuck::bytes_of(&PostfxPushConstants {
+                    frame_ptr,
+                    debug_view: self.debug_view,
+                    _pad: 0,
+                }),
+            );
             self.device.cmd_draw(cb, 3, 1, 0, 0);
 
             self.imgui_platform
@@ -1441,7 +1479,7 @@ impl Renderer {
                 .unwrap();
             let ui = self.imgui.frame();
             ui.window("Debug")
-                .size([300.0, 200.0], imgui::Condition::FirstUseEver)
+                .size([300.0, 600.0], imgui::Condition::FirstUseEver)
                 .position([0.0, 0.0], imgui::Condition::FirstUseEver)
                 .build(|| {
                     ui.text(format!("Resolution: {} x {}", size.width, size.height));
@@ -1453,27 +1491,22 @@ impl Renderer {
                     ui.text(format!("Frame Time: {:#?}", self.avg_delta_time,));
                     ui.text(format!("GPU Time: {:#?}", self.avg_gpu_time,));
                     ui.separator();
+                    ui.text(format!("Primitives: {}", self.scene.primitives.len()));
+                    ui.text(format!("Vertices: {}", self.scene.vertices_count));
+                    ui.text(format!("Triangles: {}", self.scene.triangles_count));
+                    ui.separator();
+                    let mut debug_views = vec!["Composite".to_owned()];
+                    let mut debug_view = self.debug_view as usize;
+                    for i in 0..CASCADES {
+                        debug_views.push(format!("Cascade {}", i));
+                    }
+                    if ui.combo_simple_string("Display", &mut debug_view, &debug_views) {
+                        self.debug_view = debug_view as u32;
+                    }
+                    ui.separator();
                     ui.slider("Sun Azimuth", 0.0, 360.0, &mut self.sun_azimuth);
                     ui.slider("Sun Altitude", 0.0, 90.0, &mut self.sun_altitude);
-                    for i in 0..CASCADES {
-                        ui.separator();
-                        ui.text(format!("Cascade {}", i));
-
-                        let _token = ui.push_id(format!("cascade-{i}"));
-
-                        ui.slider(
-                            "Near",
-                            self.camera.near,
-                            self.camera.cascades[i].far,
-                            &mut self.camera.cascades[i].near,
-                        );
-                        ui.slider(
-                            "Far",
-                            self.camera.cascades[i].near,
-                            self.camera.far,
-                            &mut self.camera.cascades[i].far,
-                        );
-                    }
+                    ui.slider("Cascade Lambda", 0.0, 1.0, &mut self.cascade_lambda);
                 });
             self.imgui_platform.prepare_render(&ui, &self.window);
             self.imgui_renderer

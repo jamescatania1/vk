@@ -6,6 +6,31 @@ Sampler2D shadowmaps[CASCADES];
 [[vk::binding(3, 0)]]
 Texture2D color_output;
 
+struct FrameData
+{
+    float4x4 view_proj;
+    float4x4 view;
+    float4x4 proj;
+    float3 camera_pos;
+    float3 light_dir;
+    Cascade cascades[CASCADES];
+};
+
+struct Cascade
+{
+    float4x4 view_proj;
+    float2 texel_size;
+    float near;
+    float far;
+};
+
+struct PushConstants
+{
+    FrameData *frame;
+    uint debug_view;
+    uint _pad;
+};
+
 static const float2 POSITIONS[3] = {
     float2(-1.0, -1.0),
     float2(3.0, -1.0),
@@ -33,7 +58,7 @@ VertexOutput vertex(uint vertex_index: SV_VertexID)
 }
 
 [shader("fragment")]
-float4 fragment(VertexOutput in) : SV_Target
+float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
 {
     uint width;
     uint height;
@@ -43,15 +68,9 @@ float4 fragment(VertexOutput in) : SV_Target
 
     var color = color_output.Load(uint3(pos, 0)).rgb;
 
-    if (all(in.uv > float2(0.8)) && all(in.uv <= float2(1.0)))
+    if (data.debug_view > 0 && data.debug_view <= CASCADES)
     {
-        uint shadow_width;
-        uint shadow_height;
-        shadowmaps[0].GetDimensions(shadow_width, shadow_height);
-
-        let uv = (in.uv - 0.8) / 0.2;
-        let pos = uint2(float2(shadow_width, shadow_height) * uv + 0.5);
-        color = float3(shadowmaps[0].Load(uint3(pos, 0)).r);
+        color = float3(shadowmaps[data.debug_view - 1].Sample(in.uv).r);
     }
 
     return float4(color, 1.0);

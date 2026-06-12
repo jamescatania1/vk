@@ -1,4 +1,4 @@
-static const uint CASCADES = 3;
+static const uint CASCADES = 4;
 
 struct FrameData
 {
@@ -13,6 +13,7 @@ struct FrameData
 struct Cascade
 {
     float4x4 view_proj;
+    float2 texel_size;
     float near;
     float far;
 };

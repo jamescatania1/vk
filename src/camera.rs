@@ -3,12 +3,13 @@ use std::{
     time::Duration,
 };
 
-use glam::{Mat4, UVec2, Vec3, vec3};
+use glam::{Mat4, UVec2, Vec2, Vec3, vec3};
 use winit::keyboard::KeyCode;
 
-use crate::input::Input;
+use crate::{input::Input, renderer::SHADOWMAP_SIZE, scene::SceneResources};
 
-pub const CASCADES: usize = 3;
+pub const CASCADES: usize = 4;
+const CASCADES_FAR: f32 = 40.0;
 
 #[derive(Debug)]
 pub struct Camera {
@@ -25,9 +26,10 @@ pub struct Camera {
     pub far: f32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct Cascade {
     pub view_proj: Mat4,
+    pub texel_size: Vec2,
     pub near: f32,
     pub far: f32,
 }
@@ -42,23 +44,7 @@ impl Camera {
             forward: vec3(1.0, 0.0, 0.0),
             velocity: Vec3::ZERO,
             rotation: Vec3::ZERO,
-            cascades: [
-                Cascade {
-                    view_proj: Mat4::IDENTITY,
-                    near: 0.01,
-                    far: 2.0,
-                },
-                Cascade {
-                    view_proj: Mat4::IDENTITY,
-                    near: 1.8,
-                    far: 10.0,
-                },
-                Cascade {
-                    view_proj: Mat4::IDENTITY,
-                    near: 9.0,
-                    far: 60.0,
-                },
-            ],
+            cascades: [Cascade::default(); CASCADES],
             fov: 90.0f32.to_radians(),
             near: 0.01,
             far: 200.0,
@@ -75,6 +61,8 @@ impl Camera {
         input: &Input,
         cursor_locked: bool,
         sun_dir: glam::Vec3,
+        cascade_lambda: f32,
+        scene: &SceneResources,
     ) {
         let mut in_vec = glam::ivec2(
             input.key_down(KeyCode::KeyD) as i32 - input.key_down(KeyCode::KeyA) as i32,
@@ -118,6 +106,29 @@ impl Camera {
 
         self.view_proj = self.proj * self.view;
 
+        let near = self.near;
+        let far = self.far.min(CASCADES_FAR);
+        for i in 0..=CASCADES {
+            let z = i as f32 / CASCADES as f32;
+
+            let split_unif = near + (far - near) * z;
+            let split_log = near * (far / near).powf(z);
+            let split = split_unif + (split_log - split_unif) * cascade_lambda;
+
+            if i < CASCADES {
+                self.cascades[i].near = split;
+            }
+            if i > 0 {
+                self.cascades[i - 1].far = split;
+            }
+        }
+        for i in 0..(CASCADES - 1) {
+            let range = self.cascades[i].far - self.cascades[i].near;
+            let blend_factor = 0.1;
+
+            self.cascades[i + 1].near -= range * blend_factor;
+        }
+
         for i in 0..CASCADES {
             let near = self.cascades[i].near;
             let far = self.cascades[i].far;
@@ -146,15 +157,31 @@ impl Camera {
             }
             center /= 8.0;
 
-            let view = glam::Mat4::look_at_rh(center + sun_dir, center, glam::Vec3::Z);
+            let view = glam::Mat4::look_at_rh(center, center - sun_dir, glam::Vec3::Z);
 
-            let mut radius = 0.0f32;
+            let mut min_bd = Vec3::MAX;
+            let mut max_bd = Vec3::MIN;
             for corner in frustum_corners {
                 let vs_corner = view.transform_point3(corner);
-                radius = radius.max(vs_corner.length());
+                min_bd = min_bd.min(vs_corner);
+                max_bd = max_bd.max(vs_corner);
+            }
+            for primitive in &scene.primitives {
+                for corner in primitive.bounds {
+                    let vs_corner = view.transform_point3(corner);
+                    min_bd.z = min_bd.z.min(vs_corner.z);
+                    max_bd.z = max_bd.z.max(vs_corner.z);
+                }
             }
 
-            let proj = glam::Mat4::orthographic_rh(-radius, radius, -radius, radius, -50.0, 50.0);
+            self.cascades[i].texel_size.x = SHADOWMAP_SIZE as f32 / (max_bd.x - min_bd.x);
+            self.cascades[i].texel_size.y = SHADOWMAP_SIZE as f32 / (max_bd.y - min_bd.y);
+
+            let near = -max_bd.z - 1.0;
+            let far = -min_bd.z + 1.0;
+
+            let proj =
+                glam::Mat4::orthographic_rh(min_bd.x, max_bd.x, min_bd.y, max_bd.y, near, far);
 
             self.cascades[i].view_proj = proj * view;
         }

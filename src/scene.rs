@@ -12,13 +12,9 @@ pub struct SceneResources {
     pub samplers: Vec<vk::Sampler>,
     pub object_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
     pub material_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
-    pub primitives: Vec<PrimitiveIndices>,
-}
-
-#[derive(Clone, Debug)]
-pub struct BoundingBox {
-    min: glam::Vec3A,
-    max: glam::Vec3A,
+    pub primitives: Vec<PrimitiveData>,
+    pub vertices_count: u32,
+    pub triangles_count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
@@ -49,10 +45,10 @@ struct MaterialData {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-#[repr(C)]
-pub struct PrimitiveIndices {
+pub struct PrimitiveData {
     pub object_id: u32,
     pub material_id: u32,
+    pub bounds: [glam::Vec3; 8],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +71,7 @@ impl SceneResources {
         allocator: &vk_mem::Allocator,
         command_pool: &vk::CommandPool,
     ) -> Self {
-        let (document, buffers, textures) = gltf::import("assets/sun_temple.glb").unwrap();
+        let (document, buffers, textures) = gltf::import("assets/sponza.glb").unwrap();
         let scene = document.default_scene().unwrap();
 
         fn walk_transform(node: gltf::Node, parent: Mat4, out: &mut [Mat4]) {
@@ -120,10 +116,10 @@ impl SceneResources {
                 .cast::<u8>();
 
             let transforms = transforms
-                .into_iter()
+                .iter()
                 .map(|transform| ObjectData {
                     transform: transform.to_cols_array_2d(),
-                    normal_transform: Mat3::from_mat4(transform)
+                    normal_transform: Mat3::from_mat4(transform.clone())
                         .inverse()
                         .transpose()
                         .to_cols_array_2d(),
@@ -602,6 +598,8 @@ impl SceneResources {
         let mut index_buffers = Vec::new();
         let mut index_counts = Vec::new();
         let mut primitives = Vec::new();
+        let mut vertices_count = 0;
+        let mut triangles_count = 0;
 
         for node in document.nodes() {
             let Some(mesh) = node.mesh() else {
@@ -656,9 +654,33 @@ impl SceneResources {
                     .into_u32()
                     .collect::<Vec<_>>();
 
-                primitives.push(PrimitiveIndices {
+                vertices_count += vertices.len() as u32;
+                triangles_count += indices.len() as u32 / 3;
+
+                let transform = &transforms[node.index()];
+                let mut aabb_min = glam::Vec3::MAX;
+                let mut aabb_max = glam::Vec3::MIN;
+                for vertex in &vertices {
+                    let pos = glam::Vec3::from_array(vertex.position);
+                    aabb_min = aabb_min.min(pos);
+                    aabb_max = aabb_max.max(pos);
+                }
+                let bounds = [
+                    glam::vec3(aabb_min.x, aabb_min.y, aabb_min.z),
+                    glam::vec3(aabb_min.x, aabb_min.y, aabb_max.z),
+                    glam::vec3(aabb_min.x, aabb_max.y, aabb_min.z),
+                    glam::vec3(aabb_min.x, aabb_max.y, aabb_max.z),
+                    glam::vec3(aabb_max.x, aabb_min.y, aabb_min.z),
+                    glam::vec3(aabb_max.x, aabb_min.y, aabb_max.z),
+                    glam::vec3(aabb_max.x, aabb_max.y, aabb_min.z),
+                    glam::vec3(aabb_max.x, aabb_max.y, aabb_max.z),
+                ]
+                .map(|corner| transform.transform_point3(corner));
+
+                primitives.push(PrimitiveData {
                     object_id: node.index() as u32,
                     material_id: primitive.material().index().unwrap_or(0) as u32,
+                    bounds,
                 });
 
                 let (vertex_buffer, mut vertex_allocation) = unsafe {
@@ -721,6 +743,8 @@ impl SceneResources {
             object_buffer,
             material_buffer,
             primitives,
+            vertices_count,
+            triangles_count,
         }
     }
 }

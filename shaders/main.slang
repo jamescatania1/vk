@@ -1,5 +1,5 @@
 
-static const uint CASCADES = 3;
+static const uint CASCADES = 4;
 
 [[vk::binding(0, 0)]]
 Texture2D textures[];
@@ -23,6 +23,7 @@ struct FrameData
 struct Cascade
 {
     float4x4 view_proj;
+    float2 inv_texel_size;
     float near;
     float far;
 };
@@ -134,7 +135,7 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     let depth = abs(view_pos.z);
 
     var shadow = 0.0;
-    // var sampled_cascade = false;
+    var sampled_cascade = false;
     var cascade_index = CASCADES - 1;
     for (int i = 0; i < CASCADES; i++)
     {
@@ -143,25 +144,22 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
         {
             let cascade_shadow = sample_shadow(in.world_pos, cascade, i);
 
-            shadow += cascade_shadow;
-            cascade_index = i;
-            break;
-            // if (sampled_cascade)
-            // {
-            //     let blend_factor = (depth - cascade.near) / (data.frame.cascades[i - 1].far - cascade.near);
-            //     shadow = shadow * blend_factor + cascade_shadow * (1.0 - blend_factor);
-            //     break;
-            // }
-            // else
-            // {
-            //     shadow += cascade_shadow;
-            // }
-            // sampled_cascade = true;
+            if (sampled_cascade)
+            {
+                let blend_factor = (depth - cascade.near) / (data.frame.cascades[i - 1].far - cascade.near);
+                shadow = shadow * blend_factor + cascade_shadow * (1.0 - blend_factor);
+                break;
+            }
+            else
+            {
+                shadow += cascade_shadow;
+            }
+            sampled_cascade = true;
         }
     }
 
     var res = direct * shadow + indirect;
-    // var res = float3(shadow);
+    // res = float3(shadow * 0.5 + 0.5);
     // res[cascade_index] *= 0.8;
 
     return float4(res, surface.alpha);
@@ -169,18 +167,51 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
 
 float sample_shadow(float3 world_pos, Cascade *cascade, int cascade_index)
 {
+    let shadowmap = shadowmaps[cascade_index];
+
+    uint width;
+    uint height;
+    shadowmap.GetDimensions(width, height);
+    let dimensions = float2(width, height);
+    let texel_size = 1.0 / dimensions;
+
     let light_pos = mul(cascade.view_proj, float4(world_pos, 1.0));
     let ndc = light_pos.xyz / light_pos.w;
     let uv = ndc.xy * 0.5 + 0.5;
     let depth = ndc.z;
+
     if (any(uv < float2(0.0)) || any(uv > float2(1.0)) || depth < 0.0 || depth > 1.0)
     {
-        return 0.0;
+        return 1.0;
     }
-    let shadow_depth = shadowmaps[cascade_index].Sample(uv).r;
 
-    let bias = 0.002;
-    return depth <= shadow_depth + bias ? 1.0 : 0.0;
+    let world_radius = 0.01;
+    let texel_radius = clamp(int2(world_radius * cascade.inv_texel_size), 1, 16);
+
+    var res = 0.0;
+    var sample_count = 0.0;
+    [unroll]
+    for (int x = -texel_radius.x; x <= texel_radius.x; x += 2)
+    {
+        [unroll]
+        for (int y = -texel_radius.y; y <= texel_radius.y; y += 2)
+        {
+            let offset = float2(x, y) * texel_size;
+            let sample_pos = uv + offset;
+
+            let samples = shadowmap.GatherRed(sample_pos);
+
+            [unroll]
+            for (int i = 0; i < 4; i++)
+            {
+                let bias = 0.0001;
+                res += depth < samples[i] + bias ? 1.0 : 0.0;
+            }
+            sample_count += 4.0;
+        }
+    }
+    res /= sample_count;
+    return res;
 }
 
 struct SurfaceProperties
