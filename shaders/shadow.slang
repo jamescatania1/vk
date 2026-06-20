@@ -1,47 +1,4 @@
-static const uint CASCADES = 4;
-
-struct FrameData
-{
-    float4x4 view_proj;
-    float4x4 view;
-    float4x4 proj;
-    float3 camera_pos;
-    float3 light_dir;
-    Cascade cascades[CASCADES];
-};
-
-struct Cascade
-{
-    float4x4 view_proj;
-    float2 texel_size;
-    float near;
-    float far;
-};
-
-struct ObjectData
-{
-    float4x4 transform;
-    float3x3 normal_transform;
-};
-
-struct MaterialData
-{
-    float4 albedo_factor;
-    float3 emissive_factor;
-    float metallic_factor;
-    float roughness_factor;
-    float alpha_cutoff;
-    int base_color_texture;
-    int metallic_roughness_texture;
-    int normal_texture;
-    int occlusion_texture;
-    int emissive_texture;
-    uint albedo_sampler_index;
-    uint metallic_roughness_sampler_index;
-    uint normal_sampler_index;
-    uint occlusion_sampler_index;
-    uint emissive_sampler_index;
-};
+import "utils/common";
 
 struct PushConstants
 {

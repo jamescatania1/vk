@@ -1,28 +1,4 @@
-static const uint CASCADES = 3;
-
-[[vk::binding(2, 0)]]
-Sampler2D shadowmaps[CASCADES];
-
-[[vk::binding(3, 0)]]
-Texture2D color_output;
-
-struct FrameData
-{
-    float4x4 view_proj;
-    float4x4 view;
-    float4x4 proj;
-    float3 camera_pos;
-    float3 light_dir;
-    Cascade cascades[CASCADES];
-};
-
-struct Cascade
-{
-    float4x4 view_proj;
-    float2 texel_size;
-    float near;
-    float far;
-};
+import "utils/common";
 
 struct PushConstants
 {
@@ -60,18 +36,38 @@ VertexOutput vertex(uint vertex_index: SV_VertexID)
 [shader("fragment")]
 float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
 {
-    uint width;
-    uint height;
-    color_output.GetDimensions(width, height);
+    let pos = uint2(float2(data.frame.size) * in.uv + 0.5);
 
-    let pos = uint2(float2(width, height) * in.uv + 0.5);
-
-    var color = color_output.Load(uint3(pos, 0)).rgb;
-
-    if (data.debug_view > 0 && data.debug_view <= CASCADES)
+    if (data.debug_view == 0)
     {
-        color = float3(shadowmaps[data.debug_view - 1].Sample(in.uv).r);
+        let color = tex_hdr_output.Load(int3(pos, 0)).rgb;
+        return float4(color, 1.0);
     }
+    else
+    {
+        let color = debug(pos, data);
+        return float4(color, 1.0);
+    }
+}
 
-    return float4(color, 1.0);
+float3 debug(uint2 pos, PushConstants data)
+{
+    let frag = load_fragment(pos, data.frame);
+
+    switch (data.debug_view)
+    {
+    case 1:
+        return frag.depth;
+    case 2:
+        return frag.normal;
+    case 3:
+        return frag.roughness;
+    case 4:
+        return frag.metallic;
+    case 5:
+    case 6:
+        return tex_hdr_output.Load(int3(pos, 0)).rgb;
+    default:
+        return float3(shadowmaps[data.debug_view - 6].Sample(frag.uv).r);
+    };
 }

@@ -27,7 +27,7 @@ impl ApplicationHandler for Program {
         }
 
         let cfg = Window::default_attributes()
-            .with_inner_size(LogicalSize::new(1920.0, 1080.0))
+            .with_inner_size(LogicalSize::new(1280.0, 720.0))
             .with_title("vulkan");
         let window = event_loop.create_window(cfg).unwrap();
         self.app = Some(Renderer::new(window));
