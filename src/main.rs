@@ -8,6 +8,7 @@ use winit::{
 };
 
 mod camera;
+mod config;
 mod input;
 mod renderer;
 mod scene;

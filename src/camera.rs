@@ -21,6 +21,7 @@ pub struct Camera {
     pub inv_view: Mat4,
     pub inv_proj: Mat4,
     pub inv_view_proj: Mat4,
+    pub prev_view_proj: Mat4,
     pub ndc_view_pixel_size: Vec2,
     pub cascades: [Cascade; CASCADES],
     velocity: Vec3,
@@ -28,6 +29,7 @@ pub struct Camera {
     fov: f32,
     pub near: f32,
     pub far: f32,
+    has_updated: bool,
 }
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -58,7 +60,9 @@ impl Camera {
             inv_view: Mat4::IDENTITY,
             inv_proj: Mat4::IDENTITY,
             inv_view_proj: Mat4::IDENTITY,
+            prev_view_proj: Mat4::IDENTITY,
             ndc_view_pixel_size: Vec2::ZERO,
+            has_updated: false,
         }
     }
 
@@ -113,18 +117,20 @@ impl Camera {
         );
         self.proj.y_axis.y *= -1.0;
 
-        self.view_proj = self.proj * self.view;
+        if !self.has_updated {
+            self.view_proj = self.proj * self.view;
+            self.prev_view_proj = self.view_proj;
+            self.has_updated = true;
+        } else {
+            self.prev_view_proj = self.view_proj;
+            self.view_proj = self.proj * self.view;
+        }
         self.inv_view = self.view.inverse_or_zero();
         self.inv_proj = self.proj.inverse_or_zero();
         self.inv_view_proj = self.view_proj.inverse_or_zero();
 
-        // let depth_linearize_mul = -self.proj.w_axis.z;
-        // let depth_linearize_add = -self.proj.z_axis.z;
-
         let tan_half_fov = 1.0 / glam::vec2(self.proj.x_axis.x.abs(), self.proj.y_axis.y.abs());
-        // let ndc_to_view_mul = glam::vec2(2.0, -2.0) * tan_half_fov;
-        // let ndc_to_view_add = glam::vec2(-tan_half_fov.x, tan_half_fov.y);
-        self.ndc_view_pixel_size = tan_half_fov.abs() * 2.0 * texel_size;
+        self.ndc_view_pixel_size = tan_half_fov.abs() * 2.0 * texel_size; // for ssao kernel sizing
 
         let near = self.near;
         let far = self.far.min(CASCADES_FAR);

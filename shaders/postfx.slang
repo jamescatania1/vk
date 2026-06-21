@@ -3,8 +3,6 @@ import "utils/common";
 struct PushConstants
 {
     FrameData *frame;
-    uint debug_view;
-    uint _pad;
 };
 
 static const float2 POSITIONS[3] = {
@@ -38,7 +36,7 @@ float4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
 {
     let pos = uint2(float2(data.frame.size) * in.uv + 0.5);
 
-    if (data.debug_view == 0)
+    if (data.frame.debug_view == 0)
     {
         let color = tex_hdr_output.Load(int3(pos, 0)).rgb;
         return float4(color, 1.0);
@@ -54,20 +52,24 @@ float3 debug(uint2 pos, PushConstants data)
 {
     let frag = load_fragment(pos, data.frame);
 
-    switch (data.debug_view)
+    switch (data.frame.debug_view)
     {
     case 1:
-        return frag.depth;
+        return frag.albedo;
     case 2:
-        return frag.normal;
+        return frag.depth;
     case 3:
-        return frag.roughness;
+        return frag.normal;
     case 4:
-        return frag.metallic;
+        return frag.roughness;
     case 5:
+        return frag.metallic;
     case 6:
+        return float3(frag.velocity * 0.5 + 0.5, 0.0);
+    case 7:
+    case 8:
         return tex_hdr_output.Load(int3(pos, 0)).rgb;
     default:
-        return float3(shadowmaps[data.debug_view - 6].Sample(frag.uv).r);
+        return 0.0;
     };
 }

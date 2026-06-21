@@ -13,22 +13,31 @@ use winit::{
 
 use crate::{
     camera::{CASCADES, Camera},
+    config::{Config, DEBUG_VIEW_NAMES, DEBUG_VIEWS},
     input::Input,
     scene::{self, SceneResources},
-    screen::{RenderCtx, ScreenResources},
+    screen::{ExtentExt, ScreenResources},
     shaders::Shaders,
 };
 
 const PASS_SHADOW: usize = 0;
 const PASS_PRIMARY: usize = 1;
-const PASS_AO: usize = 2;
-const PASS_DEFERRED: usize = 3;
-const PASS_POSTFX: usize = 4;
-const PASS_UI: usize = 5;
+const PASS_DEPTH_DOWNSAMPLE: usize = 2;
+const PASS_AO: usize = 3;
+const PASS_DEFERRED: usize = 4;
+const PASS_POSTFX: usize = 5;
+const PASS_UI: usize = 6;
 
-const PASS_COUNT: usize = 6;
-const PASS_NAMES: [&'static str; PASS_COUNT] =
-    ["Shadow", "Primary", "AO", "Deferred", "PostFX", "UI"];
+const PASS_COUNT: usize = 7;
+const PASS_NAMES: [&'static str; PASS_COUNT] = [
+    "Shadow",
+    "Primary",
+    "Downsample",
+    "AO",
+    "Deferred",
+    "PostFX",
+    "UI",
+];
 
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 const FRAME_ACC_ALPHA: f64 = 1.0 / 30.0;
@@ -52,8 +61,8 @@ pub struct Renderer {
     allocator: vk_mem::Allocator,
     query_pool: vk::QueryPool,
 
+    config: Config,
     screen: ScreenResources,
-
     sampler_linear: vk::Sampler,
     shadowmap: (
         vk::Image,
@@ -75,13 +84,7 @@ pub struct Renderer {
     avg_pass_times: [Duration; PASS_COUNT],
     avg_gpu_time: Duration,
     pub input: Input,
-    render_scale: f32,
     camera: Camera,
-    sun_azimuth: f64,
-    sun_altitude: f64,
-    debug_view: u32,
-    cascade_lambda: f32,
-    ao_radius: f32,
     pub cursor_locked: bool,
 
     pub imgui: imgui::Context,
@@ -92,6 +95,8 @@ pub struct Renderer {
     pipeline: vk::Pipeline,
     shadow_pipeline_layout: vk::PipelineLayout,
     shadow_pipeline: vk::Pipeline,
+    depth_downsample_pipeline_layout: vk::PipelineLayout,
+    depth_downsample_pipeline: vk::Pipeline,
     ao_pipeline_layout: vk::PipelineLayout,
     ao_pipeline: vk::Pipeline,
     deferred_pipeline_layout: vk::PipelineLayout,
@@ -117,13 +122,24 @@ pub struct FrameData {
     pub inv_view: [[f32; 4]; 4],
     pub inv_proj: [[f32; 4]; 4],
     pub inv_view_proj: [[f32; 4]; 4],
+    pub prev_view_proj: [[f32; 4]; 4],
     pub camera_pos: [f32; 3],
     pub size: [u32; 2],
     pub texel_size: [f32; 2],
+    pub size_half: [u32; 2],
+    pub texel_size_half: [f32; 2],
     pub ndc_view_pixel_size: [f32; 2],
+    pub frame_id: u32,
     pub light_dir: [f32; 3],
     pub cascades: [Cascade; CASCADES],
+    pub ao_slices: u32,
+    pub ao_samples: u32,
     pub ao_radius: f32,
+    pub ao_falloff_range: f32,
+    pub ao_sample_distribution_power: f32,
+    pub ao_thin_occluder_compensation: f32,
+    pub ao_final_value_power: f32,
+    pub debug_view: u32,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -161,12 +177,12 @@ pub struct ShadowPushConstants {
 #[repr(C)]
 pub struct PostfxPushConstants {
     pub frame_ptr: vk::DeviceAddress,
-    pub debug_view: u32,
-    pub _pad: u32,
 }
 
 impl Renderer {
     pub fn new(window: Window) -> Self {
+        let config = Config::default();
+
         let entry = unsafe { ash::Entry::load().unwrap() };
 
         let app_name = CString::new("vk demo").unwrap();
@@ -343,6 +359,7 @@ impl Renderer {
             physical_device,
             &surface_loader,
             surface,
+            &config,
         );
 
         let sampler_linear = unsafe {
@@ -526,6 +543,12 @@ impl Renderer {
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                                 .descriptor_count(1),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(1),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                                .descriptor_count(1),
                         ]),
                     None,
                 )
@@ -601,6 +624,20 @@ impl Renderer {
                             .stage_flags(
                                 vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
                             ),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(10)
+                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                            .descriptor_count(1)
+                            .stage_flags(
+                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                            ),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(11)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                            .descriptor_count(1)
+                            .stage_flags(
+                                vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
+                            ),
                     ]),
                     None,
                 )
@@ -615,7 +652,7 @@ impl Renderer {
                 )
                 .unwrap()[0]
         };
-        let image_infos = scene
+        let scene_image_infos = scene
             .images
             .iter()
             .map(|(_, _, view)| {
@@ -624,7 +661,7 @@ impl Renderer {
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             })
             .collect::<Vec<_>>();
-        let sampler_infos = scene
+        let scene_sampler_infos = scene
             .samplers
             .iter()
             .map(|sampler| vk::DescriptorImageInfo::default().sampler(*sampler))
@@ -637,25 +674,7 @@ impl Renderer {
                     .sampler(shadowmap.3)
             })
             .collect::<Vec<_>>();
-        let depth_info = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.depth.2)
-            .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL);
-        let gbuffer_info = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.gbuffer.2)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let color_output_info_storage = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.color_output.2)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let color_output_info = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.color_output.2)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let sampler_info = vk::DescriptorImageInfo::default().sampler(sampler_linear);
-        let ao_info_storage = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.ao.view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let ao_info = vk::DescriptorImageInfo::default()
-            .image_view(screen.images.ao.view)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
+        let sampler_linear_info = vk::DescriptorImageInfo::default().sampler(sampler_linear);
         unsafe {
             device.update_descriptor_sets(
                 &[
@@ -664,13 +683,13 @@ impl Renderer {
                         .dst_binding(0)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&image_infos),
+                        .image_info(&scene_image_infos),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(1)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(&sampler_infos),
+                        .image_info(&scene_sampler_infos),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(2)
@@ -679,50 +698,15 @@ impl Renderer {
                         .image_info(&shadowmap_infos),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(3)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[depth_info]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(4)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[gbuffer_info]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(5)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&[color_output_info_storage]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(6)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[color_output_info]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
                         .dst_binding(7)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLER)
-                        .image_info(&[sampler_info]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(8)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&[ao_info_storage]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
-                        .dst_binding(9)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[ao_info]),
+                        .image_info(&[sampler_linear_info]),
                 ],
                 &[],
             )
         };
+        screen.update_descriptors(&device, descriptor_set);
 
         let mut frame_data = Vec::new();
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
@@ -985,6 +969,35 @@ impl Renderer {
                 .unwrap()[0]
         };
 
+        let depth_downsample_pipeline_layout = unsafe {
+            device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .push_constant_ranges(&[vk::PushConstantRange::default()
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                        .set_layouts(&[descriptor_set_layout]),
+                    None,
+                )
+                .unwrap()
+        };
+        let depth_downsample_pipeline = unsafe {
+            device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    &[vk::ComputePipelineCreateInfo::default()
+                        .stage(
+                            vk::PipelineShaderStageCreateInfo::default()
+                                .stage(vk::ShaderStageFlags::COMPUTE)
+                                .name(&CString::new("main").unwrap())
+                                .module(shaders.depth_downsample.main),
+                        )
+                        .layout(depth_downsample_pipeline_layout)],
+                    None,
+                )
+                .unwrap()[0]
+        };
+
         let ao_pipeline_layout = unsafe {
             device
                 .create_pipeline_layout(
@@ -1136,17 +1149,14 @@ impl Renderer {
             avg_pass_times: [Duration::ZERO; PASS_COUNT],
             input: Default::default(),
             camera: Camera::new(),
-            render_scale: 0.5,
-            sun_azimuth: 45.0,
-            sun_altitude: 80.0,
-            debug_view: 0,
-            cascade_lambda: 0.8,
-            ao_radius: 0.1,
+            config,
             cursor_locked: false,
             pipeline_layout,
             pipeline,
             shadow_pipeline_layout,
             shadow_pipeline,
+            depth_downsample_pipeline_layout,
+            depth_downsample_pipeline,
             ao_pipeline_layout,
             ao_pipeline,
             deferred_pipeline_layout,
@@ -1221,15 +1231,15 @@ impl Renderer {
         }
 
         if self.screen.recreate {
-            self.screen.recreate(&RenderCtx {
-                window: &self.window,
-                device: &self.device,
-                allocator: &self.allocator,
-                physical_device: self.physical_device,
-                surface_loader: &self.surface_loader,
-                surface: self.surface,
-                descriptor_set: self.descriptor_set,
-            });
+            self.screen.recreate(
+                &self.config,
+                &self.device,
+                &self.allocator,
+                self.physical_device,
+                &self.surface_loader,
+                self.surface,
+                self.descriptor_set,
+            );
         }
 
         let (next_image_index, _suboptimal) = unsafe {
@@ -1276,8 +1286,8 @@ impl Renderer {
             self.window.set_cursor_visible(true);
         }
 
-        let az = self.sun_azimuth.to_radians() as f32;
-        let alt = self.sun_altitude.to_radians() as f32;
+        let az = self.config.sun_azimuth.to_radians() as f32;
+        let alt = self.config.sun_altitude.to_radians() as f32;
         let sun_dir = glam::vec3(alt.cos() * az.sin(), alt.cos() * az.cos(), alt.sin()).normalize();
 
         self.camera.update(
@@ -1289,7 +1299,7 @@ impl Renderer {
             &self.input,
             self.cursor_locked,
             sun_dir,
-            self.cascade_lambda,
+            self.config.cascade_lambda,
             &self.scene,
             self.screen.texel_size,
         );
@@ -1304,13 +1314,14 @@ impl Renderer {
             (*mapped).inv_view = self.camera.inv_view.to_cols_array_2d();
             (*mapped).inv_proj = self.camera.inv_proj.to_cols_array_2d();
             (*mapped).inv_view_proj = self.camera.inv_view_proj.to_cols_array_2d();
+            (*mapped).prev_view_proj = self.camera.prev_view_proj.to_cols_array_2d();
             (*mapped).camera_pos = self.camera.position.to_array();
-            (*mapped).size = [
-                self.screen.render_size.width,
-                self.screen.render_size.height,
-            ];
+            (*mapped).size = self.screen.render_size.as_uvec2().to_array();
             (*mapped).texel_size = self.screen.texel_size.to_array();
+            (*mapped).size_half = self.screen.render_size_half.as_uvec2().to_array();
+            (*mapped).texel_size_half = self.screen.texel_size_half.to_array();
             (*mapped).ndc_view_pixel_size = self.camera.ndc_view_pixel_size.to_array();
+            (*mapped).frame_id = self.frame_id as u32;
             (*mapped).light_dir = sun_dir.to_array();
             for i in 0..CASCADES {
                 let cascade = &self.camera.cascades[i];
@@ -1321,7 +1332,14 @@ impl Renderer {
                     view_proj: cascade.view_proj.to_cols_array_2d(),
                 };
             }
-            (*mapped).ao_radius = self.ao_radius;
+            (*mapped).ao_slices = self.config.ao_slices;
+            (*mapped).ao_samples = self.config.ao_samples;
+            (*mapped).ao_radius = self.config.ao_radius;
+            (*mapped).ao_falloff_range = self.config.ao_falloff_range;
+            (*mapped).ao_sample_distribution_power = self.config.ao_sample_distribution_power;
+            (*mapped).ao_thin_occluder_compensation = self.config.ao_thin_occluder_compensation;
+            (*mapped).ao_final_value_power = self.config.ao_final_value_power;
+            (*mapped).debug_view = self.config.debug_view as u32;
         }
         self.allocator
             .flush_allocation(
@@ -1504,7 +1522,7 @@ impl Renderer {
                         )
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                        .image(self.screen.images.gbuffer.0)
+                        .image(self.screen.images.gbuffer.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1518,7 +1536,7 @@ impl Renderer {
                         .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                        .image(self.screen.images.depth.0)
+                        .image(self.screen.images.depth.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1542,7 +1560,7 @@ impl Renderer {
                         .render_area(vk::Rect2D::default().extent(self.screen.render_size))
                         .layer_count(1)
                         .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                            .image_view(self.screen.images.gbuffer.2)
+                            .image_view(self.screen.images.gbuffer.view)
                             .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                             .load_op(vk::AttachmentLoadOp::CLEAR)
                             .store_op(vk::AttachmentStoreOp::STORE)
@@ -1553,7 +1571,7 @@ impl Renderer {
                             })])
                         .depth_attachment(
                             &vk::RenderingAttachmentInfo::default()
-                                .image_view(self.screen.images.depth.2)
+                                .image_view(self.screen.images.depth.view)
                                 .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -1631,13 +1649,86 @@ impl Renderer {
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                        .src_access_mask(vk::AccessFlags2::NONE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::GENERAL)
+                        .image(self.screen.images.depth_half.image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(
+                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                        )
+                        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
+                        .image(self.screen.images.depth.image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .level_count(1)
+                                .layer_count(1),
+                        ),
+                ]),
+            );
+
+            // downsample
+            {
+                self.device.cmd_write_timestamp2(
+                    cb,
+                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    query_base + PASS_DEPTH_DOWNSAMPLE as u32,
+                );
+                self.device.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.depth_downsample_pipeline,
+                );
+                self.device.cmd_bind_descriptor_sets(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.depth_downsample_pipeline_layout,
+                    0,
+                    &[self.descriptor_set],
+                    &[],
+                );
+                self.device.cmd_push_constants(
+                    cb,
+                    self.depth_downsample_pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
+                );
+                self.device.cmd_dispatch(
+                    cb,
+                    self.screen.render_size_half.width.div_ceil(8),
+                    self.screen.render_size_half.height.div_ceil(8),
+                    1,
+                );
+            }
+
+            self.device.cmd_pipeline_barrier2(
+                cb,
+                &vk::DependencyInfo::default().image_memory_barriers(&[
+                    vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                         .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                         .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                         .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
-                        .image(self.screen.images.gbuffer.0)
+                        .image(self.screen.images.gbuffer.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1659,19 +1750,16 @@ impl Renderer {
                                 .layer_count(1),
                         ),
                     vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(
-                            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                        )
-                        .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                         .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                        .old_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
-                        .image(self.screen.images.depth.0)
+                        .old_layout(vk::ImageLayout::GENERAL)
+                        .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
+                        .image(self.screen.images.depth_half.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
                                 .level_count(1)
                                 .layer_count(1),
                         ),
@@ -1701,11 +1789,7 @@ impl Renderer {
                     self.ao_pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants {
-                        frame_ptr,
-                        debug_view: self.debug_view,
-                        _pad: 0,
-                    }),
+                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
                 );
                 self.device.cmd_dispatch(
                     cb,
@@ -1756,7 +1840,7 @@ impl Renderer {
                         .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::GENERAL)
-                        .image(self.screen.images.color_output.0)
+                        .image(self.screen.images.color_output.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1792,11 +1876,7 @@ impl Renderer {
                     self.deferred_pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants {
-                        frame_ptr,
-                        debug_view: self.debug_view,
-                        _pad: 0,
-                    }),
+                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
                 );
                 self.device.cmd_dispatch(
                     cb,
@@ -1816,7 +1896,7 @@ impl Renderer {
                         .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                         .old_layout(vk::ImageLayout::GENERAL)
                         .new_layout(vk::ImageLayout::READ_ONLY_OPTIMAL)
-                        .image(self.screen.images.color_output.0)
+                        .image(self.screen.images.color_output.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1891,11 +1971,7 @@ impl Renderer {
                     self.postfx_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants {
-                        frame_ptr,
-                        debug_view: self.debug_view,
-                        _pad: 0,
-                    }),
+                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
                 );
                 self.device.cmd_draw(cb, 3, 1, 0, 0);
             }
@@ -1931,7 +2007,7 @@ impl Renderer {
                             ui.text(format!("{}: {:#?}", PASS_NAMES[i], self.avg_pass_times[i],));
                         }
                         ui.separator();
-                        if ui.slider("Render Scale", 0.125, 2.0, &mut self.screen.render_scale) {
+                        if ui.slider("Render Scale", 0.125, 2.0, &mut self.config.render_scale) {
                             self.screen.recreate = true;
                         }
                         ui.separator();
@@ -1939,28 +2015,33 @@ impl Renderer {
                         ui.text(format!("Vertices: {}", self.scene.vertices_count));
                         ui.text(format!("Triangles: {}", self.scene.triangles_count));
                         ui.separator();
-                        let mut debug_views = vec![
-                            "Composite".into(),
-                            "Depth".into(),
-                            "Normal".into(),
-                            "Roughness".into(),
-                            "Metallic".into(),
-                            "Ambient Occlusion".into(),
-                            "Shadow".into(),
-                        ];
-                        for i in 0..CASCADES {
-                            debug_views.push(format!("Cascade {}", i));
-                        }
-                        let mut debug_view = self.debug_view as usize;
-
-                        if ui.combo_simple_string("Display", &mut debug_view, &debug_views) {
-                            self.debug_view = debug_view as u32;
+                        let mut debug_view = self.config.debug_view as usize;
+                        if ui.combo_simple_string("Display", &mut debug_view, &DEBUG_VIEW_NAMES) {
+                            self.config.debug_view = DEBUG_VIEWS[debug_view];
                         }
                         ui.separator();
-                        ui.slider("Sun Azimuth", 0.0, 360.0, &mut self.sun_azimuth);
-                        ui.slider("Sun Altitude", 0.0, 90.0, &mut self.sun_altitude);
-                        ui.slider("Cascade Lambda", 0.0, 1.0, &mut self.cascade_lambda);
-                        ui.slider("AO Radius", 0.0, 1.0, &mut self.ao_radius);
+                        ui.slider("Sun Azimuth", 0.0, 360.0, &mut self.config.sun_azimuth);
+                        ui.slider("Sun Altitude", 0.0, 90.0, &mut self.config.sun_altitude);
+                        ui.slider("Cascade Lambda", 0.0, 1.0, &mut self.config.cascade_lambda);
+                        ui.separator();
+                        ui.text("Ambient Occlusion");
+                        ui.slider("Slices", 1, 16, &mut self.config.ao_slices);
+                        ui.slider("Samples", 1, 32, &mut self.config.ao_samples);
+                        ui.slider("Radius", 0.0, 2.0, &mut self.config.ao_radius);
+                        ui.slider("Falloff Range", 0.0, 1.0, &mut self.config.ao_falloff_range);
+                        ui.slider(
+                            "Sample Distribution Power",
+                            1.0,
+                            4.0,
+                            &mut self.config.ao_sample_distribution_power,
+                        );
+                        ui.slider(
+                            "Thin Occluder Compensation",
+                            0.0,
+                            1.0,
+                            &mut self.config.ao_thin_occluder_compensation,
+                        );
+                        ui.slider("Power", 0.0, 4.0, &mut self.config.ao_final_value_power);
                     });
                 self.imgui_platform.prepare_render(&ui, &self.window);
                 self.imgui_renderer

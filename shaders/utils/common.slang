@@ -29,10 +29,16 @@ public Texture2D<float4> tex_hdr_output;
 public SamplerState sampler_linear;
 
 [[vk::binding(8, 0)]]
-public RWTexture2D<float> tex_ao_storage;
+public RWTexture2D<float> tex_ao_storage[2];
 
 [[vk::binding(9, 0)]]
-public Texture2D<float> tex_ao;
+public Texture2D<float> tex_ao[2];
+
+[[vk::binding(10, 0)]]
+public RWTexture2D<float> tex_depth_half_storage;
+
+[[vk::binding(11, 0)]]
+public Texture2D<float> tex_depth_half;
 
 public struct FrameData
 {
@@ -42,13 +48,37 @@ public struct FrameData
     public float4x4 inv_view;
     public float4x4 inv_proj;
     public float4x4 inv_view_proj;
+    public float4x4 prev_view_proj;
     public float3 camera_pos;
     public uint2 size;
     public float2 texel_size;
+    public uint2 size_half;
+    public float2 texel_size_half;
     public float2 ndc_view_pixel_size;
+    public uint frame_id;
     public float3 light_dir;
     public Cascade cascades[CASCADES];
+    public uint ao_slices;
+    public uint ao_samples;
     public float ao_radius;
+    public float ao_falloff_range;
+    public float ao_sample_distribution_power;
+    public float ao_thin_occluder_compensation;
+    public float ao_final_value_power;
+    public uint debug_view;
+
+    public property uint swap_a
+    {
+        get {
+            return frame_id & 1;
+        }
+    }
+    public property uint swap_b
+    {
+        get {
+            return (frame_id + 1) & 1;
+        }
+    }
 };
 
 public struct Cascade
@@ -86,11 +116,13 @@ public struct MaterialData
 
 public struct Fragment
 {
+    public uint2 pos;
     public float2 uv;
     public float3 albedo;
     public float3 normal;
     public float roughness;
     public float metallic;
+    public float2 velocity;
     public float depth;
     public float3 ws_pos;
 };
@@ -104,11 +136,13 @@ public Fragment load_fragment(uint2 pos, FrameData *frame)
     let ws_pos = recover_world_pos(uv, depth, frame);
 
     Fragment res;
+    res.pos = pos;
     res.uv = uv;
     res.albedo = gbuffer.albedo;
     res.metallic = gbuffer.metallic;
     res.normal = gbuffer.normal;
     res.roughness = gbuffer.roughness;
+    res.velocity = gbuffer.velocity;
     res.depth = depth;
     res.ws_pos = ws_pos;
     return res;
@@ -138,6 +172,7 @@ public struct GBufferFragment
     public float3 normal;
     public float roughness;
     public float metallic;
+    public float2 velocity;
 
     public __init(uint4 packed)
     {
@@ -149,6 +184,7 @@ public struct GBufferFragment
         normal = decode_normal_octahedral(packed.y);
         roughness = float((packed.z >> 16) & 0xFFFF) / 65535.0;
         metallic = float((packed.y >> 31) & 1);
+        velocity = unpackHalf2x16ToFloat(packed.w);
     }
 
     public property uint4 packed
@@ -161,6 +197,7 @@ public struct GBufferFragment
             res.x = rgb.r << 24 | rgb.g << 16 | rgb.b << 8;
             res.y = (metallic > 0.5 ? 1 : 0) << 31 | encode_normal_octahedral(normal);
             res.z = uint(roughness * 65535.0 + 0.5) << 16;
+            res.w = packHalf2x16(velocity);
 
             return res;
         }

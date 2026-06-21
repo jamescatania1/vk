@@ -3,8 +3,6 @@ import "utils/common";
 struct PushConstants
 {
     FrameData *frame;
-    uint debug_view;
-    uint _pad;
 };
 
 [shader("compute")]
@@ -46,18 +44,18 @@ void main(uint3 id: SV_DispatchThreadID, uniform PushConstants data)
 
     // let ao = compute_ao(frag, data);
     // let ao = gtao(frag, data);
-    let ao = tex_ao.SampleLevel(sampler_linear, frag.uv, 0.0);
+    let ao = tex_ao[data.frame.swap_b].SampleLevel(sampler_linear, frag.uv, 0.0);
 
     var res = direct * shadow + indirect * ao;
 
     // res = float3(shadow * 0.5 + 0.5);
     // res[cascade_index] *= 0.8;
 
-    if (data.debug_view == 5)
+    if (data.frame.debug_view == 7)
     {
         res = float3(ao);
     }
-    if (data.debug_view == 6)
+    else if (data.frame.debug_view == 8)
     {
         res = float3(shadow);
     }

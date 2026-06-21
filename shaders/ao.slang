@@ -3,8 +3,6 @@ import "utils/common";
 struct PushConstants
 {
     FrameData *frame;
-    uint debug_view;
-    uint _pad;
 };
 
 [shader("compute")]
@@ -18,92 +16,146 @@ void main(uint3 id: SV_DispatchThreadID, uniform PushConstants data)
         return;
     }
 
-    let frag = load_fragment(pos, data.frame);
+    // let frag = load_fragment(pos, data.frame);
 
-    let ao = gtao(id.xy, frag, data);
+    let ao = gtao(id.xy, data.frame);
 
-    tex_ao_storage.Store(id.xy, ao);
+    tex_ao_storage[data.frame.swap_a].Store(id.xy, ao);
 }
 
-float gtao(uint2 id, Fragment frag, PushConstants data)
+const static uint2[4] OFFSETS = {
+    uint2(0, 0),
+    uint2(0, 1),
+    uint2(1, 0),
+    uint2(1, 1),
+};
+
+float gtao(uint2 id, FrameData *frame)
 {
-    const uint slice_count = 4;
-    const uint sample_count = 8;
-    const float falloff = 0.5;
+    // let pos = id * 2 + OFFSETS[frame.frame_id % 4];
+    let pos = id * 2;
+    let ctr_uv = (float2(pos) + 0.5) * frame.texel_size;
 
-    let vs_normal = normalize(mul((float3x3)data.frame.view, frag.normal));
-    let vs_ctr_pos = recover_view_pos(frag.uv, frag.depth, data.frame);
+    let ws_normal = GBufferFragment(tex_gbuffer.Load(int3(pos, 0))).normal;
+    let vs_normal = normalize(mul((float3x3)frame.view, ws_normal));
+
+    var ctr_depth = tex_depth.Load(int3(pos, 0));
+    let vs_ctr_pos = recover_view_pos(ctr_uv, ctr_depth, frame);
     let vs_ctr_dir = normalize(-vs_ctr_pos);
+    let vs_texel_size = abs(vs_ctr_pos.z * 0.99999) * frame.ndc_view_pixel_size;
 
-    let vs_texel_size = abs(vs_ctr_pos.z) * data.frame.ndc_view_pixel_size;
+    let screen_radius = frame.ao_radius / vs_texel_size.x;
+    let min_s = 1.3 / screen_radius;
 
-    let radius = data.frame.ao_radius / vs_texel_size.x;
-    let falloff_start = data.frame.ao_radius * (1.0 - falloff);
+    let falloff_range = frame.ao_radius * frame.ao_falloff_range;
+    let falloff_start = frame.ao_radius * (1.0 - frame.ao_falloff_range);
+    let falloff_mul = -1.0 / falloff_range;
+    let falloff_add = falloff_start / falloff_range + 1.0;
 
     let noise = hash22(id);
 
     var visibility = 0.0;
 
-    [unroll]
-    for (int slice = 0; slice < slice_count; slice++)
+    for (int slice = 0; slice < frame.ao_slices; slice++)
     {
-        let phi = (float(slice) + noise.x) * PI / float(slice_count);
-        let omega = float2(cos(phi), sin(phi));
+        let phi = (float(slice) + noise.x) * PI / float(frame.ao_slices);
+        let cos_phi = cos(phi);
+        let sin_phi = sin(phi);
+        let omega = float2(cos(phi), -sin(phi)) * screen_radius;
 
-        let direction = float3(omega, 0.0);
+        let direction = float3(cos_phi, sin_phi, 0.0);
         let ortho_direction = direction - dot(direction, vs_ctr_dir) * vs_ctr_dir;
-        let axis = normalize(cross(direction, vs_ctr_dir));
-        let proj_normal = vs_normal - axis * dot(vs_normal, axis);
+        let axis = normalize(cross(ortho_direction, vs_ctr_dir));
 
-        let sgn = sign(dot(ortho_direction, proj_normal));
-        let cos_n = saturate(dot(proj_normal, vs_ctr_dir) / length(proj_normal));
-        let n = sgn * acos(cos_n);
+        let proj_normal = vs_normal - axis * dot(vs_normal, axis);
+        var proj_normal_length = length(proj_normal);
+        let cos_normal = saturate(dot(proj_normal, vs_ctr_dir) / proj_normal_length);
+        let sign_normal = sign(dot(ortho_direction, proj_normal));
+        let n = sign_normal * fast_acos(cos_normal);
+
+        let min_horizon_cos_0 = cos(n + PI * 0.5);
+        let min_horizon_cos_1 = cos(n - PI * 0.5);
+
+        var horizon_cos_0 = min_horizon_cos_0;
+        var horizon_cos_1 = min_horizon_cos_1;
 
         [unroll]
-        for (int side = 0; side <= 1; side++)
+        for (int sample = 0; sample < frame.ao_samples; sample++)
         {
-            var horizon_cos = -1.0;
+            let sample_base_noise = float(slice + sample * frame.ao_samples) * 0.6180339887498948482;
+            let sample_noise = fract(sample_base_noise + noise.y);
 
-            [unroll]
-            for (int sample = 0; sample < sample_count; sample++)
-            {
-                let step_base_noise = float(slice + sample * sample_count) * 0.6180339887498948482;
-                let step_noise = fract(step_base_noise + noise.y);
+            var s = (float(sample) + sample_noise) / float(frame.ao_samples);
+            s = pow(s, frame.ao_sample_distribution_power);
+            s += min_s; // avoids sampling center pixel
 
-                let s = (float(sample) + step_noise) / float(sample_count);
-                let offset = (side == 0 ? -1.0 : 1.0) * s * radius * float2(omega.x, -omega.y);
-                if (max(abs(offset.x), abs(offset.y)) <= 1.0)
-                {
-                    continue;
-                }
+            var offset = int2(round(s * omega));
 
-                let uv = frag.uv + offset * data.frame.texel_size;
-                if (any(uv < 0.0) || any(uv >= 1.0))
-                {
-                    continue;
-                }
-                let pos = clamp(uint2(uv * float2(data.frame.size) + 0.5), 0, data.frame.size - 1);
+            let sample_pos_0 = clamp(int2(pos) + offset, 0, frame.size - 1);
+            let sample_pos_1 = clamp(int2(pos) - offset, 0, frame.size - 1);
 
-                let hs_sample_depth = tex_depth.Load(int3(pos, 0));
-                let vs_sample_pos = recover_view_pos(uv, hs_sample_depth, data.frame);
+            let sample_depth_0 = tex_depth.Load(int3(sample_pos_0, 0));
+            let sample_depth_1 = tex_depth.Load(int3(sample_pos_1, 0));
 
-                let sample_delta = vs_sample_pos - vs_ctr_pos;
-                let sample_distance = length(sample_delta);
-                let sample_weight = 1.0 - saturate((sample_distance - falloff_start) / max(data.frame.ao_radius - falloff_start, 1e-5));
+            let vs_sample_pos_0 = recover_view_pos((float2(sample_pos_0) + 0.5) * frame.texel_size, sample_depth_0, frame);
+            let vs_sample_pos_1 = recover_view_pos((float2(sample_pos_1) + 0.5) * frame.texel_size, sample_depth_1, frame);
 
-                let sample_horizon = normalize(sample_delta);
+            let sample_delta_0 = vs_sample_pos_0 - vs_ctr_pos;
+            let sample_delta_1 = vs_sample_pos_1 - vs_ctr_pos;
 
-                let sample_horizon_cos = lerp(-1.0, dot(sample_horizon, vs_ctr_dir), sample_weight);
-                horizon_cos = max(horizon_cos, sample_horizon_cos);
-            }
+            let sample_distance_0 = length(sample_delta_0);
+            let sample_distance_1 = length(sample_delta_1);
 
-            let horizon_angle = n + clamp((-1.0 + 2.0 * float(side)) * acos(horizon_cos) - n, -PI * 0.5, PI * 0.5);
-            visibility += length(proj_normal) * (cos_n + 2.0 * horizon_angle * sin(n) - cos(2.0 * horizon_angle - n)) * 0.25;
+            let sample_horizon_0 = sample_delta_0 / sample_distance_0;
+            let sample_horizon_1 = sample_delta_1 / sample_distance_1;
+
+            let falloff_base_0 = length(float3(sample_delta_0.x, sample_delta_0.y, sample_delta_0.z * (1.0 + frame.ao_thin_occluder_compensation)));
+            let falloff_base_1 = length(float3(sample_delta_1.x, sample_delta_1.y, sample_delta_1.z * (1.0 + frame.ao_thin_occluder_compensation)));
+
+            let weight_0 = saturate(falloff_base_0 * falloff_mul + falloff_add);
+            let weight_1 = saturate(falloff_base_1 * falloff_mul + falloff_add);
+
+            var sample_horizon_cos_0 = dot(vs_ctr_dir, sample_horizon_0);
+            var sample_horizon_cos_1 = dot(vs_ctr_dir, sample_horizon_1);
+
+            sample_horizon_cos_0 = lerp(min_horizon_cos_0, sample_horizon_cos_0, weight_0);
+            sample_horizon_cos_1 = lerp(min_horizon_cos_1, sample_horizon_cos_1, weight_1);
+
+            horizon_cos_0 = max(horizon_cos_0, sample_horizon_cos_0);
+            horizon_cos_1 = max(horizon_cos_1, sample_horizon_cos_1);
         }
+
+        // apparently fixes overdarkining on high slopes
+        // trust those smarter than myself
+        proj_normal_length = lerp(proj_normal_length, 1.0, 0.05);
+
+        let h_0 = -fast_acos(horizon_cos_1);
+        let h_1 = fast_acos(horizon_cos_0);
+
+        let arc_0 = 0.25 * (cos_normal + 2.0 * h_0 * sin(n) - cos(2.0 * h_0 - n));
+        let arc_1 = 0.25 * (cos_normal + 2.0 * h_1 * sin(n) - cos(2.0 * h_1 - n));
+
+        visibility += proj_normal_length * (arc_0 + arc_1);
     }
-    visibility /= float(slice_count);
+    visibility /= float(frame.ao_slices);
+    visibility = pow(visibility, frame.ao_final_value_power);
+    visibility = max(0.03, visibility);
 
     return saturate(visibility);
+}
+
+float fast_sqrt(float x)
+{
+    return asfloat(0x1fbd1df5 + (asint(x) >> 1));
+}
+
+float fast_acos(float x)
+{
+    x = clamp(x, -1.0, 1.0);
+    let x_abs = abs(x);
+    var res = -0.156583 * x_abs + (0.5 * PI);
+    res *= fast_sqrt(1.0 - x_abs);
+    return x >= 0.0 ? res : PI - res;
 }
 
 uint hash_u32(uint x)
