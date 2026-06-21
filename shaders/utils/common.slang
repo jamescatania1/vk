@@ -11,34 +11,37 @@ public Texture2D textures[];
 public SamplerState samplers[];
 
 [[vk::binding(2, 0)]]
-public Sampler2D shadowmaps[CASCADES];
-
-[[vk::binding(3, 0)]]
-public Texture2D<float> tex_depth;
-
-[[vk::binding(4, 0)]]
-public Texture2D<uint4> tex_gbuffer;
-
-[[vk::binding(5, 0)]]
-public RWTexture2D<float4> tex_hdr_output_storage;
-
-[[vk::binding(6, 0)]]
-public Texture2D<float4> tex_hdr_output;
-
-[[vk::binding(7, 0)]]
 public SamplerState sampler_linear;
 
+[[vk::binding(3, 0)]]
+public SamplerState sampler_nearest;
+
+[[vk::binding(4, 0)]]
+public Sampler2D shadowmaps[CASCADES];
+
+[[vk::binding(5, 0)]]
+public Texture2D<float> tex_depth;
+
+[[vk::binding(6, 0)]]
+public Texture2D<uint4> tex_gbuffer;
+
+[[vk::binding(7, 0)]]
+public RWTexture2D<float4> tex_hdr_output_storage;
+
 [[vk::binding(8, 0)]]
-public RWTexture2D<float> tex_ao_storage[2];
+public Texture2D<float4> tex_hdr_output;
 
 [[vk::binding(9, 0)]]
-public Texture2D<float> tex_ao[2];
+public RWTexture2D<float> tex_ao_storage;
 
 [[vk::binding(10, 0)]]
-public RWTexture2D<float> tex_depth_half_storage;
+public Texture2D<float> tex_ao;
 
 [[vk::binding(11, 0)]]
-public Texture2D<float> tex_depth_half;
+public RWTexture2D<float> tex_ao_history_storage[2];
+
+[[vk::binding(12, 0)]]
+public Texture2D<float> tex_ao_history[2];
 
 public struct FrameData
 {
@@ -120,6 +123,7 @@ public struct Fragment
     public float2 uv;
     public float3 albedo;
     public float3 normal;
+    public float3 geometry_normal;
     public float roughness;
     public float metallic;
     public float2 velocity;
@@ -141,6 +145,7 @@ public Fragment load_fragment(uint2 pos, FrameData *frame)
     res.albedo = gbuffer.albedo;
     res.metallic = gbuffer.metallic;
     res.normal = gbuffer.normal;
+    res.geometry_normal = gbuffer.geometry_normal;
     res.roughness = gbuffer.roughness;
     res.velocity = gbuffer.velocity;
     res.depth = depth;
@@ -170,6 +175,7 @@ public struct GBufferFragment
 {
     public float3 albedo;
     public float3 normal;
+    public float3 geometry_normal;
     public float roughness;
     public float metallic;
     public float2 velocity;
@@ -182,8 +188,9 @@ public struct GBufferFragment
                      (packed.x >> 8) & 0xFF) /
                  255.0;
         normal = decode_normal_octahedral(packed.y);
-        roughness = float((packed.z >> 16) & 0xFFFF) / 65535.0;
+        roughness = float(packed.x & 0xFF) / 255.0;
         metallic = float((packed.y >> 31) & 1);
+        geometry_normal = decode_normal_octahedral(packed.z);
         velocity = unpackHalf2x16ToFloat(packed.w);
     }
 
@@ -194,9 +201,9 @@ public struct GBufferFragment
         {
             uint4 res;
             let rgb = uint3(saturate(albedo) * 255.0 + 0.5);
-            res.x = rgb.r << 24 | rgb.g << 16 | rgb.b << 8;
+            res.x = rgb.r << 24 | rgb.g << 16 | rgb.b << 8 | uint(roughness * 255.0 + 0.5);
             res.y = (metallic > 0.5 ? 1 : 0) << 31 | encode_normal_octahedral(normal);
-            res.z = uint(roughness * 65535.0 + 0.5) << 16;
+            res.z = encode_normal_octahedral(geometry_normal);
             res.w = packHalf2x16(velocity);
 
             return res;

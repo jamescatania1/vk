@@ -42,9 +42,8 @@ void main(uint3 id: SV_DispatchThreadID, uniform PushConstants data)
 
     float shadow = compute_shadow(frag, data);
 
-    // let ao = compute_ao(frag, data);
-    // let ao = gtao(frag, data);
-    let ao = tex_ao[data.frame.swap_b].SampleLevel(sampler_linear, frag.uv, 0.0);
+    let ao = evaluate_ao(frag, data.frame);
+    // let ao = tex_ao_history[data.frame.swap_b].SampleLevel(sampler_linear, frag.uv, 0.0);
 
     var res = direct * shadow + indirect * ao;
 
@@ -60,6 +59,58 @@ void main(uint3 id: SV_DispatchThreadID, uniform PushConstants data)
         res = float3(shadow);
     }
     tex_hdr_output_storage.Store(pos, float4(res, 1.0));
+}
+
+float evaluate_ao(Fragment frag, FrameData *frame)
+{
+    static const Array<int2, 4> OFFSETS = {
+        int2(0, 0),
+        int2(0, 1),
+        int2(1, 0),
+        int2(1, 1)
+    };
+
+    let ctr_vs_pos = recover_view_pos(frag.uv, frag.depth, frame);
+    let ctr_half_base = int2(floor((float2(frag.pos) + 0.5) * 0.5 - 0.5));
+
+    var res = 0.0;
+    var weight = 0.0;
+
+    for (var i = 0; i < 4; i++)
+    {
+        let offset = OFFSETS[i];
+        let half_pos = ctr_half_base + offset;
+        let full_pos = half_pos * 2; // always sample from the top left like an idiot
+
+        if (any(half_pos < 0) || any(half_pos >= frame.size_half))
+        {
+            continue;
+        }
+
+        let depth = tex_depth.Load(int3(full_pos, 0));
+        let uv = (float2(full_pos) + 0.5) * frame.texel_size;
+        let vs_pos = recover_view_pos(uv, depth, frame);
+
+        let ao = tex_ao_history[frame.swap_b].Load(int3(half_pos, 0));
+
+        var w = 1.0;
+
+        let dist = length(float2(full_pos) - frag.pos);
+        w *= exp2(-0.5 * dist * dist);
+
+        let dz = abs(ctr_vs_pos.z - vs_pos.z);
+        let sigma = max(abs(vs_pos.z), 1.0) * 0.02;
+        w *= exp2(-(dz * dz) / (sigma * sigma));
+
+        res += ao * w;
+        weight += w;
+    }
+
+    if (weight < 1e-5)
+    {
+        return tex_ao.Load(int3(frag.pos / 2, 0));
+    }
+    return res / weight;
 }
 
 float compute_shadow(Fragment frag, PushConstants data)

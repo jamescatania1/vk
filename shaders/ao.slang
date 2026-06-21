@@ -20,7 +20,7 @@ void main(uint3 id: SV_DispatchThreadID, uniform PushConstants data)
 
     let ao = gtao(id.xy, data.frame);
 
-    tex_ao_storage[data.frame.swap_a].Store(id.xy, ao);
+    tex_ao_storage.Store(id.xy, ao);
 }
 
 const static uint2[4] OFFSETS = {
@@ -36,7 +36,7 @@ float gtao(uint2 id, FrameData *frame)
     let pos = id * 2;
     let ctr_uv = (float2(pos) + 0.5) * frame.texel_size;
 
-    let ws_normal = GBufferFragment(tex_gbuffer.Load(int3(pos, 0))).normal;
+    let ws_normal = GBufferFragment(tex_gbuffer.Load(int3(pos, 0))).geometry_normal;
     let vs_normal = normalize(mul((float3x3)frame.view, ws_normal));
 
     var ctr_depth = tex_depth.Load(int3(pos, 0));
@@ -52,7 +52,7 @@ float gtao(uint2 id, FrameData *frame)
     let falloff_mul = -1.0 / falloff_range;
     let falloff_add = falloff_start / falloff_range + 1.0;
 
-    let noise = hash22(id);
+    let noise = hash22(id + (frame.frame_id % 300) * 13);
 
     var visibility = 0.0;
 

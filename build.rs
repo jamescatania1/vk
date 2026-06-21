@@ -17,7 +17,7 @@ fn main() {
     let search_path = std::ffi::CString::new("shaders").unwrap();
 
     let opts = shader_slang::CompilerOptions::default()
-        .optimization(shader_slang::OptimizationLevel::High)
+        .optimization(shader_slang::OptimizationLevel::Maximal)
         .matrix_layout_column(true)
         .glsl_force_scalar_layout(true);
     let targets = [shader_slang::TargetDesc::default()

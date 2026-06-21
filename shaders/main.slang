@@ -73,6 +73,7 @@ uint4 fragment(VertexOutput in, uniform PushConstants data) : SV_Target
     res.metallic = surface.metallic;
     res.roughness = surface.roughness;
     res.normal = surface.normal;
+    res.geometry_normal = surface.geometry_normal;
     res.velocity = motion_vector(in);
     return res.packed;
 }
@@ -82,8 +83,8 @@ float2 motion_vector(VertexOutput in)
     let cur_ndc = in.cur_cs_pos.xy / in.cur_cs_pos.w;
     let prev_ndc = in.prev_cs_pos.xy / in.prev_cs_pos.w;
 
-    let cur_uv = cur_ndc * float2(0.5, -0.5) + 0.5;
-    let prev_uv = prev_ndc * float2(0.5, -0.5) + 0.5;
+    let cur_uv = cur_ndc * 0.5 + 0.5;
+    let prev_uv = prev_ndc * 0.5 + 0.5;
 
     return cur_uv - prev_uv;
 }
@@ -95,6 +96,7 @@ struct SurfaceProperties
     float metallic;
     float roughness;
     float3 normal;
+    float3 geometry_normal;
 };
 SurfaceProperties gather_surface(VertexOutput in, MaterialData material)
 {
@@ -122,7 +124,8 @@ SurfaceProperties gather_surface(VertexOutput in, MaterialData material)
     res.roughness = clamp(res.roughness, 0.04, 1.0);
     res.metallic = saturate(res.metallic);
 
-    res.normal = normalize(in.normal);
+    res.geometry_normal = normalize(in.normal);
+    res.normal = res.geometry_normal;
     if (material.normal_texture >= 0)
     {
         let tex = textures[material.normal_texture];

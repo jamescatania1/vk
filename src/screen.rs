@@ -29,9 +29,9 @@ pub struct Image {
 
 pub struct ScreenImages {
     pub depth: Image,
-    pub depth_half: Image,
     pub gbuffer: Image,
     pub ao: Image,
+    pub ao_history: [Image; 2],
     pub color_output: Image,
 }
 
@@ -89,48 +89,6 @@ impl ScreenImages {
                         format: DEPTH_FORMAT,
                         subresource_range: vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
-        };
-
-        let depth_half = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R32_SFLOAT)
-                        .extent(render_size_half.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: vk::Format::R32_SFLOAT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
                             .level_count(1)
                             .layer_count(1),
                         ..Default::default()
@@ -229,6 +187,48 @@ impl ScreenImages {
             }
         };
 
+        let ao_history = [0, 1].map(|_| unsafe {
+            let (image, allocation) = allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R32_SFLOAT)
+                        .extent(render_size_half.into())
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                        usage: vk_mem::MemoryUsage::Auto,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let view = device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format: vk::Format::R32_SFLOAT,
+                        subresource_range: vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            Image {
+                image,
+                allocation,
+                view,
+            }
+        });
+
         let color_output = unsafe {
             let (image, allocation) = allocator
                 .create_image(
@@ -277,9 +277,9 @@ impl ScreenImages {
 
         Self {
             depth,
-            depth_half,
             gbuffer,
             ao,
+            ao_history,
             color_output,
         }
     }
@@ -289,9 +289,6 @@ impl ScreenImages {
             device.destroy_image_view(self.depth.view, None);
             allocator.destroy_image(self.depth.image, &mut self.depth.allocation);
 
-            device.destroy_image_view(self.depth_half.view, None);
-            allocator.destroy_image(self.depth_half.image, &mut self.depth_half.allocation);
-
             device.destroy_image_view(self.color_output.view, None);
             allocator.destroy_image(self.color_output.image, &mut self.color_output.allocation);
 
@@ -300,6 +297,11 @@ impl ScreenImages {
 
             device.destroy_image_view(self.ao.view, None);
             allocator.destroy_image(self.ao.image, &mut self.ao.allocation);
+
+            for image in &mut self.ao_history {
+                device.destroy_image_view(image.view, None);
+                allocator.destroy_image(image.image, &mut image.allocation);
+            }
         }
     }
 }
@@ -414,63 +416,78 @@ impl ScreenResources {
         let ao_info = vk::DescriptorImageInfo::default()
             .image_view(self.images.ao.view)
             .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let depth_half_info_storage = vk::DescriptorImageInfo::default()
-            .image_view(self.images.depth_half.view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let depth_half_info = vk::DescriptorImageInfo::default()
-            .image_view(self.images.depth_half.view)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
+        let ao_history_infos_storage = self
+            .images
+            .ao_history
+            .iter()
+            .map(|image| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image.view)
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect::<Vec<_>>();
+        let ao_history_infos = self
+            .images
+            .ao_history
+            .iter()
+            .map(|image| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image.view)
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect::<Vec<_>>();
+
         unsafe {
             device.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(3)
+                        .dst_binding(5)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&[depth_info]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(4)
+                        .dst_binding(6)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&[gbuffer_info]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(5)
+                        .dst_binding(7)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&[color_output_info_storage]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(6)
+                        .dst_binding(8)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&[color_output_info]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(8)
+                        .dst_binding(9)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(&[ao_info_storage]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(9)
+                        .dst_binding(10)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&[ao_info]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(10)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&[depth_half_info_storage]),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(descriptor_set)
                         .dst_binding(11)
                         .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(&ao_history_infos_storage),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(12)
+                        .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[depth_half_info]),
+                        .image_info(&ao_history_infos),
                 ],
                 &[],
             )
