@@ -1,7 +1,12 @@
 use ash::vk;
-use vk_mem::Alloc;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    utils::{
+        context::{VkCtx, VkDrop},
+        image::{Image, image},
+    },
+};
 
 pub struct ScreenResources {
     pub recreate: bool,
@@ -21,12 +26,6 @@ pub struct ScreenResources {
 const SWAPCHAIN_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 
-pub struct Image {
-    pub image: vk::Image,
-    pub allocation: vk_mem::Allocation,
-    pub view: vk::ImageView,
-}
-
 pub struct ScreenImages {
     pub depth: Image,
     pub gbuffer: Image,
@@ -35,245 +34,54 @@ pub struct ScreenImages {
     pub color_output: Image,
 }
 
-pub trait ExtentExt {
-    fn mul_ceil(self, x: f32) -> Self;
-    fn as_uvec2(self) -> glam::UVec2;
-}
-impl ExtentExt for vk::Extent2D {
-    fn mul_ceil(self, x: f32) -> Self {
-        vk::Extent2D {
-            width: (self.width as f32 * x).ceil() as u32,
-            height: (self.height as f32 * x).ceil() as u32,
-        }
-    }
-    fn as_uvec2(self) -> glam::UVec2 {
-        glam::uvec2(self.width, self.height)
+impl VkDrop for ScreenImages {
+    fn destroy(&mut self, ctx: &VkCtx) {
+        self.depth.destroy(ctx);
+        self.color_output.destroy(ctx);
+        self.gbuffer.destroy(ctx);
+        self.ao.destroy(ctx);
+        self.ao_history[0].destroy(ctx);
+        self.ao_history[1].destroy(ctx);
     }
 }
 
 impl ScreenImages {
-    fn new(
-        device: &ash::Device,
-        allocator: &vk_mem::Allocator,
-        render_size: vk::Extent2D,
-        render_size_half: vk::Extent2D,
-    ) -> Self {
-        let depth = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(DEPTH_FORMAT)
-                        .extent(render_size.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(
-                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                                | vk::ImageUsageFlags::SAMPLED,
-                        )
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: DEPTH_FORMAT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
-        };
+    fn new(ctx: &VkCtx, render_size: vk::Extent2D, render_size_half: vk::Extent2D) -> Self {
+        let depth = image()
+            .format(DEPTH_FORMAT)
+            .extent_2d(render_size.into())
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .create(ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY);
 
-        let gbuffer = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R32G32B32A32_UINT)
-                        .extent(render_size.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: vk::Format::R32G32B32A32_UINT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
-        };
+        let gbuffer = image()
+            .format(vk::Format::R32G32B32A32_UINT)
+            .extent_2d(render_size.into())
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .create(ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY);
 
-        let ao = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R32_SFLOAT)
-                        .extent(render_size_half.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: vk::Format::R32_SFLOAT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
-        };
+        let ao = image()
+            .extent_2d(render_size_half)
+            .format(vk::Format::R32_SFLOAT)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+            .create(ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY);
 
-        let ao_history = [0, 1].map(|_| unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R32_SFLOAT)
-                        .extent(render_size_half.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: vk::Format::R32_SFLOAT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
+        let ao_history = [0, 1].map(|_| {
+            image()
+                .extent_2d(render_size_half)
+                .format(vk::Format::R32_SFLOAT)
+                .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
+                .create(ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY)
         });
 
-        let color_output = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R16G16B16A16_SFLOAT)
-                        .extent(render_size.into())
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(
-                            vk::ImageUsageFlags::COLOR_ATTACHMENT
-                                | vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::SAMPLED,
-                        )
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let view = device
-                .create_image_view(
-                    &vk::ImageViewCreateInfo {
-                        image,
-                        view_type: vk::ImageViewType::TYPE_2D,
-                        format: vk::Format::R16G16B16A16_SFLOAT,
-                        subresource_range: vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap();
-            Image {
-                image,
-                allocation,
-                view,
-            }
-        };
+        let color_output = image()
+            .extent_2d(render_size)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
+            .usage(
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+                    | vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::SAMPLED,
+            )
+            .create(ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY);
 
         Self {
             depth,
@@ -283,43 +91,14 @@ impl ScreenImages {
             color_output,
         }
     }
-
-    fn destroy(&mut self, device: &ash::Device, allocator: &vk_mem::Allocator) {
-        unsafe {
-            device.destroy_image_view(self.depth.view, None);
-            allocator.destroy_image(self.depth.image, &mut self.depth.allocation);
-
-            device.destroy_image_view(self.color_output.view, None);
-            allocator.destroy_image(self.color_output.image, &mut self.color_output.allocation);
-
-            device.destroy_image_view(self.gbuffer.view, None);
-            allocator.destroy_image(self.gbuffer.image, &mut self.gbuffer.allocation);
-
-            device.destroy_image_view(self.ao.view, None);
-            allocator.destroy_image(self.ao.image, &mut self.ao.allocation);
-
-            for image in &mut self.ao_history {
-                device.destroy_image_view(image.view, None);
-                allocator.destroy_image(image.image, &mut image.allocation);
-            }
-        }
-    }
 }
 
 impl ScreenResources {
-    pub fn new(
-        instance: &ash::Instance,
-        device: &ash::Device,
-        allocator: &vk_mem::Allocator,
-        physical_device: vk::PhysicalDevice,
-        surface_loader: &ash::khr::surface::Instance,
-        surface: vk::SurfaceKHR,
-        config: &Config,
-    ) -> Self {
-        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+    pub fn new(ctx: &VkCtx, config: &Config) -> Self {
+        let swapchain_loader = ash::khr::swapchain::Device::new(&ctx.instance, &ctx.device);
         let surface_capabilities = unsafe {
-            surface_loader
-                .get_physical_device_surface_capabilities(physical_device, surface)
+            ctx.surface_loader
+                .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)
                 .unwrap()
         };
 
@@ -335,7 +114,7 @@ impl ScreenResources {
             let swapchain = swapchain_loader
                 .create_swapchain(
                     &vk::SwapchainCreateInfoKHR::default()
-                        .surface(surface)
+                        .surface(ctx.surface)
                         .min_image_count(surface_capabilities.min_image_count)
                         .image_format(SWAPCHAIN_FORMAT)
                         .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
@@ -352,7 +131,7 @@ impl ScreenResources {
             let views = images
                 .iter()
                 .map(|img| {
-                    device
+                    ctx.device
                         .create_image_view(
                             &vk::ImageViewCreateInfo::default()
                                 .image(*img)
@@ -375,11 +154,14 @@ impl ScreenResources {
 
         let mut render_complete_semaphores = Vec::new();
         for _ in 0..swapchain_images.len() {
-            render_complete_semaphores
-                .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
+            render_complete_semaphores.push(unsafe {
+                ctx.device
+                    .create_semaphore(&Default::default(), None)
+                    .unwrap()
+            });
         }
 
-        let images = ScreenImages::new(device, allocator, render_size, render_size_half);
+        let images = ScreenImages::new(ctx, render_size, render_size_half);
 
         Self {
             recreate: false,
@@ -397,91 +179,74 @@ impl ScreenResources {
         }
     }
 
-    pub fn update_descriptors(&self, device: &ash::Device, descriptor_set: vk::DescriptorSet) {
-        let depth_info = vk::DescriptorImageInfo::default()
-            .image_view(self.images.depth.view)
-            .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL);
-        let gbuffer_info = vk::DescriptorImageInfo::default()
-            .image_view(self.images.gbuffer.view)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let color_output_info_storage = vk::DescriptorImageInfo::default()
-            .image_view(self.images.color_output.view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let color_output_info = vk::DescriptorImageInfo::default()
-            .image_view(self.images.color_output.view)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let ao_info_storage = vk::DescriptorImageInfo::default()
-            .image_view(self.images.ao.view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let ao_info = vk::DescriptorImageInfo::default()
-            .image_view(self.images.ao.view)
-            .image_layout(vk::ImageLayout::READ_ONLY_OPTIMAL);
-        let ao_history_infos_storage = self
-            .images
-            .ao_history
-            .iter()
-            .map(|image| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(image.view)
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect::<Vec<_>>();
+    pub fn update_descriptors(&mut self, ctx: &VkCtx, descriptor_set: vk::DescriptorSet) {
         let ao_history_infos = self
             .images
             .ao_history
-            .iter()
-            .map(|image| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(image.view)
-                    .image_layout(vk::ImageLayout::GENERAL)
-            })
+            .iter_mut()
+            .map(|img| img.info_default(ctx, vk::ImageLayout::GENERAL))
             .collect::<Vec<_>>();
 
         unsafe {
-            device.update_descriptor_sets(
+            ctx.device.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(5)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[depth_info]),
+                        .image_info(&[self
+                            .images
+                            .depth
+                            .info_default(ctx, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(6)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[gbuffer_info]),
+                        .image_info(&[self
+                            .images
+                            .gbuffer
+                            .info_default(ctx, vk::ImageLayout::READ_ONLY_OPTIMAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(7)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&[color_output_info_storage]),
+                        .image_info(&[self
+                            .images
+                            .color_output
+                            .info_default(ctx, vk::ImageLayout::GENERAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(8)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[color_output_info]),
+                        .image_info(&[self
+                            .images
+                            .color_output
+                            .info_default(ctx, vk::ImageLayout::READ_ONLY_OPTIMAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(9)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&[ao_info_storage]),
+                        .image_info(&[self.images.ao.info_default(ctx, vk::ImageLayout::GENERAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(10)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                        .image_info(&[ao_info]),
+                        .image_info(&[self
+                            .images
+                            .ao
+                            .info_default(ctx, vk::ImageLayout::READ_ONLY_OPTIMAL)]),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(11)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                        .image_info(&ao_history_infos_storage),
+                        .image_info(&ao_history_infos),
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
                         .dst_binding(12)
@@ -494,34 +259,26 @@ impl ScreenResources {
         };
     }
 
-    pub fn recreate(
-        &mut self,
-        cfg: &Config,
-        device: &ash::Device,
-        allocator: &vk_mem::Allocator,
-        physical_device: vk::PhysicalDevice,
-        surface_loader: &ash::khr::surface::Instance,
-        surface: vk::SurfaceKHR,
-        descriptor_set: vk::DescriptorSet,
-    ) {
+    pub fn recreate(&mut self, ctx: &VkCtx, cfg: &Config, descriptor_set: vk::DescriptorSet) {
         self.recreate = false;
         unsafe {
-            device.device_wait_idle().unwrap();
+            ctx.device.device_wait_idle().unwrap();
         };
         let old_swapchain = self.swapchain;
 
         for sem in self.render_complete_semaphores.drain(..) {
-            unsafe { device.destroy_semaphore(sem, None) };
+            unsafe { ctx.device.destroy_semaphore(sem, None) };
         }
         for view in self.swapchain_views.drain(..) {
-            unsafe { device.destroy_image_view(view, None) };
+            unsafe { ctx.device.destroy_image_view(view, None) };
         }
 
-        self.images.destroy(&device, &allocator);
+        self.images.destroy(&ctx);
+        // self.images.destroy(&ctx.device, &ctx.allocator);
 
         let surface_capabilities = unsafe {
-            surface_loader
-                .get_physical_device_surface_capabilities(physical_device, surface)
+            ctx.surface_loader
+                .get_physical_device_surface_capabilities(ctx.physical_device, ctx.surface)
                 .unwrap()
         };
 
@@ -537,7 +294,7 @@ impl ScreenResources {
             self.swapchain_loader
                 .create_swapchain(
                     &vk::SwapchainCreateInfoKHR::default()
-                        .surface(surface)
+                        .surface(ctx.surface)
                         .min_image_count(surface_capabilities.min_image_count)
                         .image_format(SWAPCHAIN_FORMAT)
                         .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
@@ -563,7 +320,7 @@ impl ScreenResources {
             let views = images
                 .iter()
                 .map(|img| {
-                    device
+                    ctx.device
                         .create_image_view(
                             &vk::ImageViewCreateInfo::default()
                                 .image(*img)
@@ -583,15 +340,33 @@ impl ScreenResources {
             (images, views)
         };
 
-        self.images =
-            ScreenImages::new(&device, &allocator, self.render_size, self.render_size_half);
+        self.images = ScreenImages::new(ctx, self.render_size, self.render_size_half);
 
         self.render_complete_semaphores = Vec::new();
         for _ in 0..self.swapchain_images.len() {
-            self.render_complete_semaphores
-                .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
+            self.render_complete_semaphores.push(unsafe {
+                ctx.device
+                    .create_semaphore(&Default::default(), None)
+                    .unwrap()
+            });
         }
 
-        self.update_descriptors(device, descriptor_set);
+        self.update_descriptors(ctx, descriptor_set);
+    }
+}
+
+pub trait ExtentExt {
+    fn mul_ceil(self, x: f32) -> Self;
+    fn as_uvec2(self) -> glam::UVec2;
+}
+impl ExtentExt for vk::Extent2D {
+    fn mul_ceil(self, x: f32) -> Self {
+        vk::Extent2D {
+            width: (self.width as f32 * x).ceil() as u32,
+            height: (self.height as f32 * x).ceil() as u32,
+        }
+    }
+    fn as_uvec2(self) -> glam::UVec2 {
+        glam::uvec2(self.width, self.height)
     }
 }

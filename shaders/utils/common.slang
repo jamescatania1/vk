@@ -17,7 +17,7 @@ public SamplerState sampler_linear;
 public SamplerState sampler_nearest;
 
 [[vk::binding(4, 0)]]
-public Sampler2D shadowmaps[CASCADES];
+public Texture2D<float> shadowmaps[CASCADES];
 
 [[vk::binding(5, 0)]]
 public Texture2D<float> tex_depth;

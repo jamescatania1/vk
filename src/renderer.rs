@@ -1,15 +1,12 @@
 use std::{
-    ffi::{CStr, CString},
+    ffi::CString,
     time::{Duration, Instant},
 };
 
 use ash::vk::{self};
 use bytemuck::{Pod, Zeroable};
 use vk_mem::Alloc;
-use winit::{
-    raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::Window,
-};
+use winit::window::Window;
 
 use crate::{
     camera::{CASCADES, Camera},
@@ -18,6 +15,11 @@ use crate::{
     scene::{self, SceneResources},
     screen::{ExtentExt, ScreenResources},
     shaders::Shaders,
+    utils::{
+        buffer::Buffer,
+        context::VkCtx,
+        image::{Image, image},
+    },
 };
 
 const PASS_SHADOW: usize = 0;
@@ -47,37 +49,17 @@ const SHADOWMAP_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
 pub const SHADOWMAP_SIZE: u32 = 2048;
 
 pub struct Renderer {
-    entry: ash::Entry,
-    instance: ash::Instance,
-
     pub window: Window,
-    surface_loader: ash::khr::surface::Instance,
-    surface: vk::SurfaceKHR,
-
-    device: ash::Device,
-    physical_device: vk::PhysicalDevice,
-    physical_device_properties: vk::PhysicalDeviceProperties,
-    queue: vk::Queue,
-    allocator: vk_mem::Allocator,
+    ctx: VkCtx,
     query_pool: vk::QueryPool,
 
     config: Config,
     screen: ScreenResources,
     sampler_linear: vk::Sampler,
     sampler_nearest: vk::Sampler,
-    shadowmap: (
-        vk::Image,
-        vk_mem::Allocation,
-        Vec<vk::ImageView>,
-        vk::Sampler,
-    ),
+    shadowmap: Image,
     scene: SceneResources,
-    frame_data: Vec<(
-        vk::Buffer,
-        vk_mem::Allocation,
-        *mut FrameData,
-        vk::DeviceAddress,
-    )>,
+    frame_data: Vec<Buffer>,
     frame_id: u64,
     prev_fixed_time: Instant,
     prev_frame_time: Instant,
@@ -107,14 +89,11 @@ pub struct Renderer {
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
-    command_buffers: Vec<vk::CommandBuffer>,
-    frame_fences: Vec<vk::Fence>,
-    image_acquired_semaphores: Vec<vk::Semaphore>,
     image_index: usize,
     frame_index: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct FrameData {
     pub view_proj: [[f32; 4]; 4],
@@ -143,7 +122,7 @@ pub struct FrameData {
     pub debug_view: u32,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Cascade {
     pub view_proj: [[f32; 4]; 4],
@@ -154,7 +133,7 @@ pub struct Cascade {
 
 #[derive(Debug, Clone, Copy, Default, Zeroable, Pod)]
 #[repr(C)]
-pub struct PushConstants {
+pub struct PrimaryPushConstants {
     pub frame_ptr: vk::DeviceAddress,
     pub objects_ptr: vk::DeviceAddress,
     pub materials_ptr: vk::DeviceAddress,
@@ -176,7 +155,7 @@ pub struct ShadowPushConstants {
 
 #[derive(Debug, Clone, Copy, Default, Zeroable, Pod)]
 #[repr(C)]
-pub struct PostfxPushConstants {
+pub struct BasicPushConstants {
     pub frame_ptr: vk::DeviceAddress,
 }
 
@@ -184,187 +163,26 @@ impl Renderer {
     pub fn new(window: Window) -> Self {
         let config = Config::default();
 
-        let entry = unsafe { ash::Entry::load().unwrap() };
+        let ctx = VkCtx::new(&window, MAX_FRAMES_IN_FLIGHT);
 
-        let app_name = CString::new("vk demo").unwrap();
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .engine_version(vk::make_api_version(0, 0, 1, 0))
-            .api_version(vk::API_VERSION_1_3);
+        let mut screen = ScreenResources::new(&ctx, &config);
 
-        let available_extensions =
-            unsafe { entry.enumerate_instance_extension_properties(None).unwrap() };
-        let has_instance_extension = |name: &CStr| {
-            available_extensions.iter().any(|ext| {
-                let ext_name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                ext_name == name
-            })
-        };
-        let validate =
-            cfg!(debug_assertions) && has_instance_extension(&ash::ext::debug_utils::NAME);
-        let portability = has_instance_extension(ash::khr::portability_enumeration::NAME);
-
-        let mut extension_names =
-            ash_window::enumerate_required_extensions(window.display_handle().unwrap().as_raw())
-                .unwrap()
-                .to_vec();
-        if validate {
-            extension_names.push(ash::ext::debug_utils::NAME.as_ptr());
-        }
-        if portability {
-            extension_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
-        }
-
-        let validation_layer = CString::new("VK_LAYER_KHRONOS_validation").unwrap();
-        let layer_names = if validate {
-            vec![validation_layer.as_ptr()]
-        } else {
-            Vec::new()
-        };
-
-        let mut instance_flags = vk::InstanceCreateFlags::empty();
-        if portability {
-            instance_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-        }
-
-        let instance = unsafe {
-            entry
-                .create_instance(
-                    &vk::InstanceCreateInfo::default()
-                        .application_info(&app_info)
-                        .enabled_layer_names(&layer_names)
-                        .enabled_extension_names(&extension_names)
-                        .flags(instance_flags),
-                    None,
+        let frame_data = (0..MAX_FRAMES_IN_FLIGHT)
+            .map(|_| {
+                Buffer::new(
+                    &ctx,
+                    std::mem::size_of::<FrameData>() as u64,
+                    vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::STORAGE_BUFFER,
+                    vk_mem::MemoryUsage::Auto,
+                    vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
+                        | vk_mem::AllocationCreateFlags::MAPPED,
                 )
-                .unwrap()
-        };
-
-        let surface = unsafe {
-            ash_window::create_surface(
-                &entry,
-                &instance,
-                window.display_handle().unwrap().as_raw(),
-                window.window_handle().unwrap().as_raw(),
-                None,
-            )
-            .unwrap()
-        };
-        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
-
-        let physical_device = unsafe { instance.enumerate_physical_devices().unwrap() }
-            .into_iter()
-            .next()
-            .unwrap();
-        let physical_device_properties =
-            unsafe { instance.get_physical_device_properties(physical_device) };
-
-        let (queue_family_index, _queue_family) =
-            unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
-                .into_iter()
-                .enumerate()
-                .filter(|(i, q)| {
-                    let graphics_valid = q.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-                    let surface_valid = unsafe {
-                        surface_loader
-                            .get_physical_device_surface_support(
-                                physical_device,
-                                *i as u32,
-                                surface,
-                            )
-                            .unwrap_or(false)
-                    };
-                    graphics_valid && surface_valid
-                })
-                .next()
-                .map(|(i, q)| (i as u32, q))
-                .unwrap();
-
-        let available_device_extensions = unsafe {
-            instance
-                .enumerate_device_extension_properties(physical_device)
-                .unwrap()
-        };
-        let has_device_extension = |name: &CStr| {
-            available_device_extensions.iter().any(|ext| {
-                let ext_name = unsafe { CStr::from_ptr(ext.extension_name.as_ptr()) };
-                ext_name == name
             })
-        };
-
-        let mut device_extensions = Vec::new();
-        device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
-        if has_device_extension(ash::khr::portability_subset::NAME) {
-            device_extensions.push(ash::khr::portability_subset::NAME.as_ptr());
-        }
-        if has_device_extension(ash::khr::dynamic_rendering_local_read::NAME) {
-            device_extensions.push(ash::khr::dynamic_rendering_local_read::NAME.as_ptr());
-        }
-
-        let vk_10_features = vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
-        let mut vk_11_features =
-            vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
-        let mut vk_12_features = vk::PhysicalDeviceVulkan12Features::default()
-            .descriptor_indexing(true)
-            .shader_sampled_image_array_non_uniform_indexing(true)
-            .descriptor_binding_variable_descriptor_count(true)
-            .runtime_descriptor_array(true)
-            .buffer_device_address(true)
-            .scalar_block_layout(true);
-        let mut vk_13_features = vk::PhysicalDeviceVulkan13Features::default()
-            .synchronization2(true)
-            .dynamic_rendering(true);
-
-        let p_queue_priorities = [1.0];
-
-        let device = unsafe {
-            instance
-                .create_device(
-                    physical_device,
-                    &&vk::DeviceCreateInfo::default()
-                        .queue_create_infos(&[vk::DeviceQueueCreateInfo {
-                            queue_family_index,
-                            queue_count: 1,
-                            p_queue_priorities: p_queue_priorities.as_ptr(),
-                            ..Default::default()
-                        }])
-                        .enabled_extension_names(&device_extensions)
-                        .enabled_features(&vk_10_features)
-                        .push_next(&mut vk_13_features)
-                        .push_next(&mut vk_12_features)
-                        .push_next(&mut vk_11_features),
-                    None,
-                )
-                .unwrap()
-        };
-        let queue = unsafe {
-            device.get_device_queue2(
-                &vk::DeviceQueueInfo2::default()
-                    .queue_family_index(queue_family_index)
-                    .queue_index(0),
-            )
-        };
-
-        let allocator = unsafe {
-            let mut allocator_create_info =
-                vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
-            allocator_create_info.flags = vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
-            vk_mem::Allocator::new(allocator_create_info)
-        }
-        .unwrap();
-
-        let screen = ScreenResources::new(
-            &instance,
-            &device,
-            &allocator,
-            physical_device,
-            &surface_loader,
-            surface,
-            &config,
-        );
+            .collect::<Vec<_>>();
 
         let sampler_linear = unsafe {
-            device
+            ctx.device
                 .create_sampler(
                     &vk::SamplerCreateInfo::default()
                         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -378,7 +196,7 @@ impl Renderer {
                 .unwrap()
         };
         let sampler_nearest = unsafe {
-            device
+            ctx.device
                 .create_sampler(
                     &vk::SamplerCreateInfo::default()
                         .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -391,91 +209,21 @@ impl Renderer {
                 )
                 .unwrap()
         };
-        let shadowmap = unsafe {
-            let (image, allocation) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(SHADOWMAP_FORMAT)
-                        .extent(vk::Extent3D {
-                            width: SHADOWMAP_SIZE,
-                            height: SHADOWMAP_SIZE,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(CASCADES as u32)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(
-                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                                | vk::ImageUsageFlags::SAMPLED,
-                        )
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
-                        usage: vk_mem::MemoryUsage::Auto,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let views = (0..CASCADES)
-                .map(|i| {
-                    device
-                        .create_image_view(
-                            &vk::ImageViewCreateInfo {
-                                image,
-                                view_type: vk::ImageViewType::TYPE_2D,
-                                format: SHADOWMAP_FORMAT,
-                                subresource_range: vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                    .base_array_layer(i as u32)
-                                    .level_count(1)
-                                    .layer_count(1),
-                                ..Default::default()
-                            },
-                            None,
-                        )
-                        .unwrap()
-                })
-                .collect::<Vec<_>>();
-            let sampler = device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::default()
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
-                        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
-                        .anisotropy_enable(false)
-                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST),
-                    None,
-                )
-                .unwrap();
-            (image, allocation, views, sampler)
-        };
 
-        let command_pool = unsafe {
-            device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo {
-                        flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                        queue_family_index,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap()
-        };
-        let command_buffers = unsafe {
-            device
-                .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-                    command_pool,
-                    command_buffer_count: MAX_FRAMES_IN_FLIGHT,
-                    ..Default::default()
-                })
-                .unwrap()
-        };
+        let mut shadowmap = image()
+            .extent_2d_array(
+                vk::Extent2D {
+                    width: SHADOWMAP_SIZE,
+                    height: SHADOWMAP_SIZE,
+                },
+                CASCADES as u32,
+            )
+            .format(SHADOWMAP_FORMAT)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+            .create(&ctx, vk_mem::AllocationCreateFlags::DEDICATED_MEMORY);
 
         let query_pool = unsafe {
-            device
+            ctx.device
                 .create_query_pool(
                     &vk::QueryPoolCreateInfo::default()
                         .query_type(vk::QueryType::TIMESTAMP)
@@ -494,11 +242,11 @@ impl Renderer {
             imgui_winit_support::HiDpiMode::Default,
         );
         let imgui_renderer = imgui_rs_vulkan_renderer::Renderer::with_default_allocator(
-            &instance,
-            physical_device,
-            device.clone(),
-            queue,
-            command_pool,
+            &ctx.instance,
+            ctx.physical_device,
+            ctx.device.clone(),
+            ctx.queue,
+            ctx.command_pool,
             imgui_rs_vulkan_renderer::DynamicRendering {
                 color_attachment_format: SWAPCHAIN_FORMAT,
                 depth_attachment_format: Some(DEPTH_FORMAT),
@@ -514,16 +262,10 @@ impl Renderer {
         )
         .unwrap();
 
-        let scene = SceneResources::create(
-            &physical_device_properties,
-            &device,
-            &queue,
-            &allocator,
-            &command_pool,
-        );
+        let mut scene = SceneResources::create(&ctx);
 
         let descriptor_pool = unsafe {
-            device
+            ctx.device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
                         .max_sets(1)
@@ -541,7 +283,7 @@ impl Renderer {
                                 .ty(vk::DescriptorType::SAMPLER)
                                 .descriptor_count(1),
                             vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .ty(vk::DescriptorType::SAMPLED_IMAGE)
                                 .descriptor_count(CASCADES as u32),
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
@@ -573,7 +315,7 @@ impl Renderer {
                 .unwrap()
         };
         let descriptor_set_layout = unsafe {
-            device
+            ctx.device
                 .create_descriptor_set_layout(
                     &&vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
                         vk::DescriptorSetLayoutBinding::default()
@@ -602,7 +344,7 @@ impl Renderer {
                             ),
                         vk::DescriptorSetLayoutBinding::default()
                             .binding(4)
-                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                             .descriptor_count(CASCADES as u32)
                             .stage_flags(
                                 vk::ShaderStageFlags::FRAGMENT | vk::ShaderStageFlags::COMPUTE,
@@ -669,7 +411,7 @@ impl Renderer {
                 .unwrap()
         };
         let descriptor_set = unsafe {
-            device
+            ctx.device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(descriptor_pool)
@@ -679,12 +421,8 @@ impl Renderer {
         };
         let scene_image_infos = scene
             .images
-            .iter()
-            .map(|(_, _, view)| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(*view)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            })
+            .iter_mut()
+            .map(|img| img.info_default(&ctx, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL))
             .collect::<Vec<_>>();
         let scene_sampler_infos = scene
             .samplers
@@ -695,14 +433,11 @@ impl Renderer {
         let sampler_nearest_info = vk::DescriptorImageInfo::default().sampler(sampler_nearest);
         let shadowmap_infos = (0..CASCADES)
             .map(|i| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(shadowmap.2[i])
-                    .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
-                    .sampler(shadowmap.3)
+                shadowmap.info_array_layer(&ctx, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL, i as u32)
             })
             .collect::<Vec<_>>();
         unsafe {
-            device.update_descriptor_sets(
+            ctx.device.update_descriptor_sets(
                 &[
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
@@ -732,76 +467,25 @@ impl Renderer {
                         .dst_set(descriptor_set)
                         .dst_binding(4)
                         .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
                         .image_info(&shadowmap_infos),
                 ],
                 &[],
             )
         };
-        screen.update_descriptors(&device, descriptor_set);
+        screen.update_descriptors(&ctx, descriptor_set);
 
-        let mut frame_data = Vec::new();
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            let (buffer, allocation) = unsafe {
-                allocator
-                    .create_buffer(
-                        &vk::BufferCreateInfo::default()
-                            .size(std::mem::size_of::<FrameData>() as u64)
-                            .usage(
-                                vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                                    | vk::BufferUsageFlags::STORAGE_BUFFER,
-                            ),
-                        &vk_mem::AllocationCreateInfo {
-                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::MAPPED,
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            };
-            let mapped = allocator
-                .get_allocation_info(&allocation)
-                .mapped_data
-                .cast::<FrameData>();
-            let address = unsafe {
-                device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(buffer),
-                )
-            };
-            frame_data.push((buffer, allocation, mapped, address));
-        }
-
-        let mut frame_fences = Vec::new();
-        let mut image_acquired_semaphores = Vec::new();
-
-        for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            frame_fences.push(unsafe {
-                device
-                    .create_fence(
-                        &vk::FenceCreateInfo {
-                            flags: vk::FenceCreateFlags::SIGNALED,
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .unwrap()
-            });
-            image_acquired_semaphores
-                .push(unsafe { device.create_semaphore(&Default::default(), None).unwrap() });
-        }
-
-        let shaders = Shaders::new(&device);
+        let shaders = Shaders::new(&ctx.device);
 
         let pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .stage_flags(
                                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                             )
-                            .size(std::mem::size_of::<PushConstants>() as u32)])
+                            .size(std::mem::size_of::<PrimaryPushConstants>() as u32)])
                         .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
@@ -809,7 +493,7 @@ impl Renderer {
         };
 
         let pipeline = unsafe {
-            device
+            ctx.device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::GraphicsPipelineCreateInfo::default()
@@ -913,7 +597,7 @@ impl Renderer {
         };
 
         let shadow_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&[
                         vk::PushConstantRange::default()
@@ -928,7 +612,7 @@ impl Renderer {
         };
 
         let shadow_pipeline = unsafe {
-            device
+            ctx.device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::GraphicsPipelineCreateInfo::default()
@@ -1002,19 +686,19 @@ impl Renderer {
         };
 
         let ao_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                            .size(std::mem::size_of::<BasicPushConstants>() as u32)])
                         .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
                 .unwrap()
         };
         let ao_pipeline = unsafe {
-            device
+            ctx.device
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
@@ -1031,19 +715,19 @@ impl Renderer {
         };
 
         let ao_reproject_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                            .size(std::mem::size_of::<BasicPushConstants>() as u32)])
                         .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
                 .unwrap()
         };
         let ao_reproject_pipeline = unsafe {
-            device
+            ctx.device
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
@@ -1060,19 +744,19 @@ impl Renderer {
         };
 
         let deferred_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                            .size(std::mem::size_of::<BasicPushConstants>() as u32)])
                         .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
                 .unwrap()
         };
         let deferred_pipeline = unsafe {
-            device
+            ctx.device
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::ComputePipelineCreateInfo::default()
@@ -1089,14 +773,14 @@ impl Renderer {
         };
 
         let postfx_pipeline_layout = unsafe {
-            device
+            ctx.device
                 .create_pipeline_layout(
                     &vk::PipelineLayoutCreateInfo::default()
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .stage_flags(
                                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                             )
-                            .size(std::mem::size_of::<PostfxPushConstants>() as u32)])
+                            .size(std::mem::size_of::<BasicPushConstants>() as u32)])
                         .set_layouts(&[descriptor_set_layout]),
                     None,
                 )
@@ -1104,7 +788,7 @@ impl Renderer {
         };
 
         let postfx_pipeline = unsafe {
-            device
+            ctx.device
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
                     &[vk::GraphicsPipelineCreateInfo::default()
@@ -1158,16 +842,8 @@ impl Renderer {
         };
 
         Self {
-            entry,
             window,
-            allocator,
-            instance,
-            surface_loader,
-            surface,
-            device,
-            physical_device,
-            physical_device_properties,
-            queue,
+            ctx,
             screen,
             shadowmap,
             sampler_linear,
@@ -1203,9 +879,6 @@ impl Renderer {
             descriptor_pool,
             descriptor_set_layout,
             descriptor_set,
-            command_buffers,
-            frame_fences,
-            image_acquired_semaphores,
             image_index: 0,
             frame_index: 0,
         }
@@ -1221,8 +894,9 @@ impl Renderer {
         self.prev_frame_time = time;
 
         unsafe {
-            self.device
-                .wait_for_fences(&[self.frame_fences[self.frame_index]], true, u64::MAX)
+            self.ctx
+                .device
+                .wait_for_fences(&[self.ctx.frame_fences[self.frame_index]], true, u64::MAX)
                 .unwrap();
         };
 
@@ -1231,7 +905,7 @@ impl Renderer {
         if self.frame_id >= MAX_FRAMES_IN_FLIGHT as u64 {
             let mut timestamps = [0u64; PASS_COUNT + 1];
             unsafe {
-                match self.device.get_query_pool_results(
+                match self.ctx.device.get_query_pool_results(
                     self.query_pool,
                     query_base,
                     &mut timestamps,
@@ -1240,8 +914,8 @@ impl Renderer {
                     Ok(()) => {
                         let delta_total = Duration::from_nanos(
                             (timestamps[PASS_COUNT].wrapping_sub(timestamps[0]) as f64
-                                * self.physical_device_properties.limits.timestamp_period as f64)
-                                as u64,
+                                * self.ctx.physical_device_properties.limits.timestamp_period
+                                    as f64) as u64,
                         );
                         self.avg_gpu_time = self.avg_gpu_time.mul_f64(1.0 - FRAME_ACC_ALPHA)
                             + delta_total.mul_f64(FRAME_ACC_ALPHA);
@@ -1249,7 +923,7 @@ impl Renderer {
                         for i in 0..PASS_COUNT {
                             let delta = Duration::from_nanos(
                                 (timestamps[i + 1].wrapping_sub(timestamps[i]) as f64
-                                    * self.physical_device_properties.limits.timestamp_period
+                                    * self.ctx.physical_device_properties.limits.timestamp_period
                                         as f64) as u64,
                             );
                             self.avg_pass_times[i] = self.avg_pass_times[i]
@@ -1264,22 +938,15 @@ impl Renderer {
         }
 
         if self.screen.recreate {
-            self.screen.recreate(
-                &self.config,
-                &self.device,
-                &self.allocator,
-                self.physical_device,
-                &self.surface_loader,
-                self.surface,
-                self.descriptor_set,
-            );
+            self.screen
+                .recreate(&self.ctx, &self.config, self.descriptor_set);
         }
 
         let (next_image_index, _suboptimal) = unsafe {
             match self.screen.swapchain_loader.acquire_next_image(
                 self.screen.swapchain,
                 u64::MAX,
-                self.image_acquired_semaphores[self.frame_index],
+                self.ctx.image_acquired_semaphores[self.frame_index],
                 vk::Fence::null(),
             ) {
                 Ok(res) => res,
@@ -1294,8 +961,9 @@ impl Renderer {
         };
 
         unsafe {
-            self.device
-                .reset_fences(&[self.frame_fences[self.frame_index]])
+            self.ctx
+                .device
+                .reset_fences(&[self.ctx.frame_fences[self.frame_index]])
                 .unwrap()
         }
         self.image_index = next_image_index as usize;
@@ -1339,63 +1007,58 @@ impl Renderer {
 
         self.input.update();
 
-        unsafe {
-            let mapped = self.frame_data[self.frame_index].2;
-            (*mapped).view_proj = self.camera.view_proj.to_cols_array_2d();
-            (*mapped).view = self.camera.view.to_cols_array_2d();
-            (*mapped).proj = self.camera.proj.to_cols_array_2d();
-            (*mapped).inv_view = self.camera.inv_view.to_cols_array_2d();
-            (*mapped).inv_proj = self.camera.inv_proj.to_cols_array_2d();
-            (*mapped).inv_view_proj = self.camera.inv_view_proj.to_cols_array_2d();
-            (*mapped).prev_view_proj = self.camera.prev_view_proj.to_cols_array_2d();
-            (*mapped).camera_pos = self.camera.position.to_array();
-            (*mapped).size = self.screen.render_size.as_uvec2().to_array();
-            (*mapped).texel_size = self.screen.texel_size.to_array();
-            (*mapped).size_half = self.screen.render_size_half.as_uvec2().to_array();
-            (*mapped).texel_size_half = self.screen.texel_size_half.to_array();
-            (*mapped).ndc_view_pixel_size = self.camera.ndc_view_pixel_size.to_array();
-            (*mapped).frame_id = self.frame_id as u32;
-            (*mapped).light_dir = sun_dir.to_array();
-            for i in 0..CASCADES {
-                let cascade = &self.camera.cascades[i];
-                (*mapped).cascades[i] = Cascade {
+        self.frame_data[self.frame_index].write(
+            &self.ctx,
+            bytemuck::bytes_of(&FrameData {
+                view_proj: self.camera.view_proj.to_cols_array_2d(),
+                view: self.camera.view.to_cols_array_2d(),
+                proj: self.camera.proj.to_cols_array_2d(),
+                inv_view: self.camera.inv_view.to_cols_array_2d(),
+                inv_proj: self.camera.inv_proj.to_cols_array_2d(),
+                inv_view_proj: self.camera.inv_view_proj.to_cols_array_2d(),
+                prev_view_proj: self.camera.prev_view_proj.to_cols_array_2d(),
+                camera_pos: self.camera.position.to_array(),
+                size: self.screen.render_size.as_uvec2().to_array(),
+                texel_size: self.screen.texel_size.to_array(),
+                size_half: self.screen.render_size_half.as_uvec2().to_array(),
+                texel_size_half: self.screen.texel_size_half.to_array(),
+                ndc_view_pixel_size: self.camera.ndc_view_pixel_size.to_array(),
+                frame_id: self.frame_id as u32,
+                light_dir: sun_dir.to_array(),
+                cascades: self.camera.cascades.map(|cascade| Cascade {
                     near: cascade.near,
                     far: cascade.far,
                     texel_size: cascade.texel_size.to_array(),
                     view_proj: cascade.view_proj.to_cols_array_2d(),
-                };
-            }
-            (*mapped).ao_slices = self.config.ao_slices;
-            (*mapped).ao_samples = self.config.ao_samples;
-            (*mapped).ao_radius = self.config.ao_radius;
-            (*mapped).ao_falloff_range = self.config.ao_falloff_range;
-            (*mapped).ao_sample_distribution_power = self.config.ao_sample_distribution_power;
-            (*mapped).ao_thin_occluder_compensation = self.config.ao_thin_occluder_compensation;
-            (*mapped).ao_final_value_power = self.config.ao_final_value_power;
-            (*mapped).debug_view = self.config.debug_view as u32;
-        }
-        self.allocator
-            .flush_allocation(
-                &self.frame_data[self.frame_index].1,
-                0,
-                std::mem::size_of::<FrameData>() as u64,
-            )
-            .unwrap();
+                }),
+                ao_slices: self.config.ao_slices,
+                ao_samples: self.config.ao_samples,
+                ao_radius: self.config.ao_radius,
+                ao_falloff_range: self.config.ao_falloff_range,
+                ao_sample_distribution_power: self.config.ao_sample_distribution_power,
+                ao_thin_occluder_compensation: self.config.ao_thin_occluder_compensation,
+                ao_final_value_power: self.config.ao_final_value_power,
+                debug_view: self.config.debug_view as u32,
+            }),
+        );
+        self.frame_data[self.frame_index].flush(&self.ctx);
 
-        let frame_ptr = self.frame_data[self.frame_index].3;
-        let objects_ptr = self.scene.object_buffer.2;
-        let materials_ptr = self.scene.material_buffer.2;
+        let frame_ptr = self.frame_data[self.frame_index].address(&self.ctx);
+        let objects_ptr = self.scene.object_buffer.address(&self.ctx);
+        let materials_ptr = self.scene.material_buffer.address(&self.ctx);
 
-        let cb = self.command_buffers[self.frame_index];
+        let cb = self.ctx.command_buffers[self.frame_index];
 
         let swap_index_a = (self.frame_id as u32 & 1) as usize;
         let swap_index_b = ((self.frame_id as u32 + 1) & 1) as usize;
 
         unsafe {
-            self.device
+            self.ctx
+                .device
                 .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
                 .unwrap();
-            self.device
+            self.ctx
+                .device
                 .begin_command_buffer(
                     cb,
                     &vk::CommandBufferBeginInfo::default()
@@ -1403,7 +1066,7 @@ impl Renderer {
                 )
                 .unwrap();
 
-            self.device.cmd_reset_query_pool(
+            self.ctx.device.cmd_reset_query_pool(
                 cb,
                 self.query_pool,
                 query_base,
@@ -1411,14 +1074,14 @@ impl Renderer {
             );
 
             // shadow pass
-            self.device.cmd_write_timestamp2(
+            self.ctx.device.cmd_write_timestamp2(
                 cb,
                 vk::PipelineStageFlags2::TOP_OF_PIPE,
                 self.query_pool,
                 query_base + PASS_SHADOW as u32,
             );
             for cascade in 0..CASCADES {
-                self.device.cmd_pipeline_barrier2(
+                self.ctx.device.cmd_pipeline_barrier2(
                     cb,
                     &vk::DependencyInfo::default().image_memory_barriers(&[
                         vk::ImageMemoryBarrier2::default()
@@ -1431,7 +1094,7 @@ impl Renderer {
                             .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                             .old_layout(vk::ImageLayout::UNDEFINED)
                             .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                            .image(self.shadowmap.0)
+                            .image(self.shadowmap.image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1442,7 +1105,7 @@ impl Renderer {
                     ]),
                 );
 
-                self.device.cmd_begin_rendering(
+                self.ctx.device.cmd_begin_rendering(
                     cb,
                     &vk::RenderingInfo::default()
                         .render_area(vk::Rect2D::default().extent(vk::Extent2D {
@@ -1453,7 +1116,9 @@ impl Renderer {
                         .color_attachments(&[])
                         .depth_attachment(
                             &vk::RenderingAttachmentInfo::default()
-                                .image_view(self.shadowmap.2[cascade])
+                                .image_view(
+                                    self.shadowmap.view_array_layer(&self.ctx, cascade as u32),
+                                )
                                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -1465,7 +1130,7 @@ impl Renderer {
                                 }),
                         ),
                 );
-                self.device.cmd_set_viewport(
+                self.ctx.device.cmd_set_viewport(
                     cb,
                     0,
                     &[vk::Viewport {
@@ -1477,7 +1142,7 @@ impl Renderer {
                         max_depth: 1.0,
                     }],
                 );
-                self.device.cmd_set_scissor(
+                self.ctx.device.cmd_set_scissor(
                     cb,
                     0,
                     &[vk::Rect2D {
@@ -1488,25 +1153,25 @@ impl Renderer {
                         offset: vk::Offset2D { x: 0, y: 0 },
                     }],
                 );
-                self.device.cmd_bind_pipeline(
+                self.ctx.device.cmd_bind_pipeline(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.shadow_pipeline,
                 );
                 for i in 0..self.scene.vertex_buffers.len() {
-                    self.device.cmd_bind_vertex_buffers(
+                    self.ctx.device.cmd_bind_vertex_buffers(
                         cb,
                         0,
-                        &[self.scene.vertex_buffers[i].0],
+                        &[self.scene.vertex_buffers[i].buffer],
                         &[0],
                     );
-                    self.device.cmd_bind_index_buffer(
+                    self.ctx.device.cmd_bind_index_buffer(
                         cb,
-                        self.scene.index_buffers[i].0,
+                        self.scene.index_buffers[i].buffer,
                         0,
                         vk::IndexType::UINT32,
                     );
-                    self.device.cmd_push_constants(
+                    self.ctx.device.cmd_push_constants(
                         cb,
                         self.shadow_pipeline_layout,
                         vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
@@ -1521,14 +1186,15 @@ impl Renderer {
                             _pad: 0,
                         }),
                     );
-                    self.device
+                    self.ctx
+                        .device
                         .cmd_draw_indexed(cb, self.scene.index_counts[i], 1, 0, 0, 0);
                 }
 
-                self.device.cmd_end_rendering(cb);
+                self.ctx.device.cmd_end_rendering(cb);
             }
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -1541,7 +1207,7 @@ impl Renderer {
                         .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ)
                         .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                         .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
-                        .image(self.shadowmap.0)
+                        .image(self.shadowmap.image)
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
                                 .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1584,19 +1250,19 @@ impl Renderer {
 
             // main pass
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
                     query_base + PASS_PRIMARY as u32,
                 );
-                self.device.cmd_begin_rendering(
+                self.ctx.device.cmd_begin_rendering(
                     cb,
                     &vk::RenderingInfo::default()
                         .render_area(vk::Rect2D::default().extent(self.screen.render_size))
                         .layer_count(1)
                         .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                            .image_view(self.screen.images.gbuffer.view)
+                            .image_view(self.screen.images.gbuffer.view_default(&self.ctx))
                             .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                             .load_op(vk::AttachmentLoadOp::CLEAR)
                             .store_op(vk::AttachmentStoreOp::STORE)
@@ -1607,7 +1273,7 @@ impl Renderer {
                             })])
                         .depth_attachment(
                             &vk::RenderingAttachmentInfo::default()
-                                .image_view(self.screen.images.depth.view)
+                                .image_view(self.screen.images.depth.view_default(&self.ctx))
                                 .image_layout(vk::ImageLayout::ATTACHMENT_OPTIMAL)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -1619,7 +1285,7 @@ impl Renderer {
                                 }),
                         ),
                 );
-                self.device.cmd_set_viewport(
+                self.ctx.device.cmd_set_viewport(
                     cb,
                     0,
                     &[vk::Viewport {
@@ -1631,7 +1297,7 @@ impl Renderer {
                         max_depth: 1.0,
                     }],
                 );
-                self.device.cmd_set_scissor(
+                self.ctx.device.cmd_set_scissor(
                     cb,
                     0,
                     &[vk::Rect2D {
@@ -1639,9 +1305,12 @@ impl Renderer {
                         offset: vk::Offset2D { x: 0, y: 0 },
                     }],
                 );
-                self.device
-                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
-                self.device.cmd_bind_descriptor_sets(
+                self.ctx.device.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.pipeline_layout,
@@ -1650,24 +1319,24 @@ impl Renderer {
                     &[],
                 );
                 for i in 0..self.scene.vertex_buffers.len() {
-                    self.device.cmd_bind_vertex_buffers(
+                    self.ctx.device.cmd_bind_vertex_buffers(
                         cb,
                         0,
-                        &[self.scene.vertex_buffers[i].0],
+                        &[self.scene.vertex_buffers[i].buffer],
                         &[0],
                     );
-                    self.device.cmd_bind_index_buffer(
+                    self.ctx.device.cmd_bind_index_buffer(
                         cb,
-                        self.scene.index_buffers[i].0,
+                        self.scene.index_buffers[i].buffer,
                         0,
                         vk::IndexType::UINT32,
                     );
-                    self.device.cmd_push_constants(
+                    self.ctx.device.cmd_push_constants(
                         cb,
                         self.pipeline_layout,
                         vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                         0,
-                        bytemuck::bytes_of(&PushConstants {
+                        bytemuck::bytes_of(&PrimaryPushConstants {
                             frame_ptr,
                             objects_ptr,
                             materials_ptr,
@@ -1675,13 +1344,14 @@ impl Renderer {
                             material_id: self.scene.primitives[i].material_id,
                         }),
                     );
-                    self.device
+                    self.ctx
+                        .device
                         .cmd_draw_indexed(cb, self.scene.index_counts[i], 1, 0, 0, 0);
                 }
-                self.device.cmd_end_rendering(cb);
+                self.ctx.device.cmd_end_rendering(cb);
             }
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -1734,15 +1404,18 @@ impl Renderer {
 
             // ao
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
                     query_base + PASS_AO as u32,
                 );
-                self.device
-                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.ao_pipeline);
-                self.device.cmd_bind_descriptor_sets(
+                self.ctx.device.cmd_bind_pipeline(
+                    cb,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.ao_pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
                     self.ao_pipeline_layout,
@@ -1750,14 +1423,14 @@ impl Renderer {
                     &[self.descriptor_set],
                     &[],
                 );
-                self.device.cmd_push_constants(
+                self.ctx.device.cmd_push_constants(
                     cb,
                     self.ao_pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
+                    bytemuck::bytes_of(&BasicPushConstants { frame_ptr }),
                 );
-                self.device.cmd_dispatch(
+                self.ctx.device.cmd_dispatch(
                     cb,
                     self.screen.render_size.width.div_ceil(8 * 2),
                     self.screen.render_size.height.div_ceil(8 * 2),
@@ -1765,7 +1438,7 @@ impl Renderer {
                 );
             }
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -1815,18 +1488,18 @@ impl Renderer {
 
             // ao reproject
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
                     query_base + PASS_AO_REPROJECT as u32,
                 );
-                self.device.cmd_bind_pipeline(
+                self.ctx.device.cmd_bind_pipeline(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
                     self.ao_reproject_pipeline,
                 );
-                self.device.cmd_bind_descriptor_sets(
+                self.ctx.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
                     self.ao_reproject_pipeline_layout,
@@ -1834,14 +1507,14 @@ impl Renderer {
                     &[self.descriptor_set],
                     &[],
                 );
-                self.device.cmd_push_constants(
+                self.ctx.device.cmd_push_constants(
                     cb,
                     self.ao_reproject_pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
+                    bytemuck::bytes_of(&BasicPushConstants { frame_ptr }),
                 );
-                self.device.cmd_dispatch(
+                self.ctx.device.cmd_dispatch(
                     cb,
                     self.screen.render_size.width.div_ceil(8 * 2),
                     self.screen.render_size.height.div_ceil(8 * 2),
@@ -1849,7 +1522,7 @@ impl Renderer {
                 );
             }
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -1885,18 +1558,18 @@ impl Renderer {
 
             // deferred
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
                     query_base + PASS_DEFERRED as u32,
                 );
-                self.device.cmd_bind_pipeline(
+                self.ctx.device.cmd_bind_pipeline(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
                     self.deferred_pipeline,
                 );
-                self.device.cmd_bind_descriptor_sets(
+                self.ctx.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::COMPUTE,
                     self.deferred_pipeline_layout,
@@ -1904,14 +1577,14 @@ impl Renderer {
                     &[self.descriptor_set],
                     &[],
                 );
-                self.device.cmd_push_constants(
+                self.ctx.device.cmd_push_constants(
                     cb,
                     self.deferred_pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
+                    bytemuck::bytes_of(&BasicPushConstants { frame_ptr }),
                 );
-                self.device.cmd_dispatch(
+                self.ctx.device.cmd_dispatch(
                     cb,
                     self.screen.render_size.width.div_ceil(8),
                     self.screen.render_size.height.div_ceil(8),
@@ -1919,7 +1592,7 @@ impl Renderer {
                 );
             }
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -1958,13 +1631,13 @@ impl Renderer {
 
             // post fx
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
                     query_base + PASS_POSTFX as u32,
                 );
-                self.device.cmd_begin_rendering(
+                self.ctx.device.cmd_begin_rendering(
                     cb,
                     &vk::RenderingInfo::default()
                         .render_area(vk::Rect2D::default().extent(self.screen.viewport_size))
@@ -1980,7 +1653,7 @@ impl Renderer {
                                 },
                             })]),
                 );
-                self.device.cmd_set_viewport(
+                self.ctx.device.cmd_set_viewport(
                     cb,
                     0,
                     &[vk::Viewport {
@@ -1992,7 +1665,7 @@ impl Renderer {
                         max_depth: 1.0,
                     }],
                 );
-                self.device.cmd_set_scissor(
+                self.ctx.device.cmd_set_scissor(
                     cb,
                     0,
                     &[vk::Rect2D {
@@ -2003,12 +1676,12 @@ impl Renderer {
                         offset: vk::Offset2D { x: 0, y: 0 },
                     }],
                 );
-                self.device.cmd_bind_pipeline(
+                self.ctx.device.cmd_bind_pipeline(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.postfx_pipeline,
                 );
-                self.device.cmd_bind_descriptor_sets(
+                self.ctx.device.cmd_bind_descriptor_sets(
                     cb,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.postfx_pipeline_layout,
@@ -2016,19 +1689,19 @@ impl Renderer {
                     &[self.descriptor_set],
                     &[],
                 );
-                self.device.cmd_push_constants(
+                self.ctx.device.cmd_push_constants(
                     cb,
                     self.postfx_pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    bytemuck::bytes_of(&PostfxPushConstants { frame_ptr }),
+                    bytemuck::bytes_of(&BasicPushConstants { frame_ptr }),
                 );
-                self.device.cmd_draw(cb, 3, 1, 0, 0);
+                self.ctx.device.cmd_draw(cb, 3, 1, 0, 0);
             }
 
             // draw ui
             {
-                self.device.cmd_write_timestamp2(
+                self.ctx.device.cmd_write_timestamp2(
                     cb,
                     vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                     self.query_pool,
@@ -2098,17 +1771,17 @@ impl Renderer {
                     .cmd_draw(cb, imgui::Context::render(&mut self.imgui))
                     .unwrap();
 
-                self.device.cmd_end_rendering(cb);
+                self.ctx.device.cmd_end_rendering(cb);
             }
 
-            self.device.cmd_write_timestamp2(
+            self.ctx.device.cmd_write_timestamp2(
                 cb,
                 vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
                 self.query_pool,
                 query_base + PASS_COUNT as u32,
             );
 
-            self.device.cmd_pipeline_barrier2(
+            self.ctx.device.cmd_pipeline_barrier2(
                 cb,
                 &vk::DependencyInfo::default().image_memory_barriers(&[
                     vk::ImageMemoryBarrier2::default()
@@ -2127,26 +1800,27 @@ impl Renderer {
                         ),
                 ]),
             );
-            self.device.end_command_buffer(cb).unwrap();
+            self.ctx.device.end_command_buffer(cb).unwrap();
 
-            self.device
+            self.ctx
+                .device
                 .queue_submit(
-                    self.queue,
+                    self.ctx.queue,
                     &[vk::SubmitInfo::default()
-                        .wait_semaphores(&[self.image_acquired_semaphores[self.frame_index]])
+                        .wait_semaphores(&[self.ctx.image_acquired_semaphores[self.frame_index]])
                         .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
                         .command_buffers(&[cb])
                         .signal_semaphores(&[
                             self.screen.render_complete_semaphores[self.image_index]
                         ])],
-                    self.frame_fences[self.frame_index],
+                    self.ctx.frame_fences[self.frame_index],
                 )
                 .unwrap();
 
             self.frame_index = (self.frame_index + 1) % (MAX_FRAMES_IN_FLIGHT as usize);
 
             match self.screen.swapchain_loader.queue_present(
-                self.queue,
+                self.ctx.queue,
                 &vk::PresentInfoKHR::default()
                     .wait_semaphores(&[self.screen.render_complete_semaphores[self.image_index]])
                     .swapchains(&[self.screen.swapchain])
@@ -2181,7 +1855,7 @@ impl Renderer {
 impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
-            self.device.device_wait_idle().unwrap();
+            self.ctx.device.device_wait_idle().unwrap();
             // self.device.destroy_image_view(self.depth_view, None);
             // self.allocator
             //     .destroy_image(self.depth_image, &mut self.depth_allocation);
@@ -2189,9 +1863,11 @@ impl Drop for Renderer {
                 .swapchain_loader
                 .destroy_swapchain(self.screen.swapchain, None);
 
-            self.device.destroy_device(None);
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
+            self.ctx.device.destroy_device(None);
+            self.ctx
+                .surface_loader
+                .destroy_surface(self.ctx.surface, None);
+            self.ctx.instance.destroy_instance(None);
         };
     }
 }

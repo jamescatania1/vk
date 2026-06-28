@@ -178,7 +178,7 @@ float sample_cascade(float3 world_pos, Cascade *cascade, int cascade_index)
             let offset = float2(x, y) * texel_size;
             let sample_pos = uv + offset;
 
-            let samples = shadowmap.GatherRed(sample_pos);
+            let samples = shadowmap.GatherRed(sampler_nearest, sample_pos);
 
             [unroll]
             for (int i = 0; i < 4; i++)

@@ -3,15 +3,20 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Quat, Vec3};
 use vk_mem::Alloc;
 
-#[derive(Debug)]
+use crate::utils::{
+    buffer::Buffer,
+    context::VkCtx,
+    image::{Image, image},
+};
+
 pub struct SceneResources {
-    pub vertex_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
-    pub index_buffers: Vec<(vk::Buffer, vk_mem::Allocation)>,
+    pub vertex_buffers: Vec<Buffer>,
+    pub index_buffers: Vec<Buffer>,
     pub index_counts: Vec<u32>,
-    pub images: Vec<(vk::Image, vk_mem::Allocation, vk::ImageView)>,
+    pub images: Vec<Image>,
     pub samplers: Vec<vk::Sampler>,
-    pub object_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
-    pub material_buffer: (vk::Buffer, vk_mem::Allocation, vk::DeviceAddress),
+    pub object_buffer: Buffer,
+    pub material_buffer: Buffer,
     pub primitives: Vec<PrimitiveData>,
     pub vertices_count: u32,
     pub triangles_count: u32,
@@ -51,7 +56,7 @@ pub struct PrimitiveData {
     pub bounds: [glam::Vec3; 8],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct VertexData {
     pub position: [f32; 3],
@@ -64,13 +69,7 @@ pub struct VertexData {
 const ANISOTROPIC_SAMPLES: f32 = 16.0;
 
 impl SceneResources {
-    pub fn create(
-        physical_device_properties: &vk::PhysicalDeviceProperties,
-        device: &ash::Device,
-        queue: &vk::Queue,
-        allocator: &vk_mem::Allocator,
-        command_pool: &vk::CommandPool,
-    ) -> Self {
+    pub fn create(ctx: &VkCtx) -> Self {
         let (document, buffers, textures) = gltf::import("assets/sponza.glb").unwrap();
         let scene = document.default_scene().unwrap();
 
@@ -93,29 +92,7 @@ impl SceneResources {
         }
 
         let object_buffer = {
-            let size = std::mem::size_of::<ObjectData>() * transforms.len();
-            let (buffer, allocation) = unsafe {
-                allocator
-                    .create_buffer(
-                        &vk::BufferCreateInfo::default().size(size as u64).usage(
-                            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                                | vk::BufferUsageFlags::STORAGE_BUFFER,
-                        ),
-                        &vk_mem::AllocationCreateInfo {
-                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::MAPPED,
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            };
-            let mapped = allocator
-                .get_allocation_info(&allocation)
-                .mapped_data
-                .cast::<u8>();
-
-            let transforms = transforms
+            let data = transforms
                 .iter()
                 .map(|transform| ObjectData {
                     transform: transform.to_cols_array_2d(),
@@ -125,23 +102,11 @@ impl SceneResources {
                         .to_cols_array_2d(),
                 })
                 .collect::<Vec<_>>();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytemuck::cast_slice(&transforms).as_ptr(),
-                    mapped,
-                    size,
-                );
-            }
-            allocator
-                .flush_allocation(&allocation, 0, size as u64)
-                .unwrap();
-
-            let address = unsafe {
-                device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(buffer),
-                )
-            };
-            (buffer, allocation, address)
+            Buffer::from_data(
+                ctx,
+                vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
+                bytemuck::cast_slice(&data),
+            )
         };
 
         let mut samplers = Vec::new();
@@ -153,9 +118,9 @@ impl SceneResources {
         for address_mode_u in ADDRESS_MODES {
             for address_mode_v in ADDRESS_MODES {
                 samplers.push(unsafe {
-                    device
+                    ctx.device
                         .create_sampler(
-                            &&&&vk::SamplerCreateInfo::default()
+                            &vk::SamplerCreateInfo::default()
                                 .address_mode_u(address_mode_u)
                                 .address_mode_v(address_mode_v)
                                 .mag_filter(vk::Filter::LINEAR)
@@ -164,11 +129,9 @@ impl SceneResources {
                                 .min_lod(0.0)
                                 .max_lod(vk::LOD_CLAMP_NONE)
                                 .anisotropy_enable(true)
-                                .max_anisotropy(
-                                    ANISOTROPIC_SAMPLES.min(
-                                        physical_device_properties.limits.max_sampler_anisotropy,
-                                    ),
-                                ),
+                                .max_anisotropy(ANISOTROPIC_SAMPLES.min(
+                                    ctx.physical_device_properties.limits.max_sampler_anisotropy,
+                                )),
                             None,
                         )
                         .unwrap()
@@ -187,7 +150,7 @@ impl SceneResources {
         }
 
         let material_buffer = {
-            let materials = document
+            let data = document
                 .materials()
                 .into_iter()
                 .map(|mat| {
@@ -241,45 +204,11 @@ impl SceneResources {
                     }
                 })
                 .collect::<Vec<_>>();
-
-            let size = std::mem::size_of::<MaterialData>() * materials.len();
-            let (buffer, allocation) = unsafe {
-                allocator
-                    .create_buffer(
-                        &vk::BufferCreateInfo::default().size(size as u64).usage(
-                            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                                | vk::BufferUsageFlags::STORAGE_BUFFER,
-                        ),
-                        &vk_mem::AllocationCreateInfo {
-                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::MAPPED,
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            };
-            let mapped = allocator
-                .get_allocation_info(&allocation)
-                .mapped_data
-                .cast::<u8>();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytemuck::cast_slice(&materials).as_ptr(),
-                    mapped,
-                    size,
-                );
-            }
-            allocator
-                .flush_allocation(&allocation, 0, size as u64)
-                .unwrap();
-
-            let address = unsafe {
-                device.get_buffer_device_address(
-                    &vk::BufferDeviceAddressInfo::default().buffer(buffer),
-                )
-            };
-            (buffer, allocation, address)
+            Buffer::from_data(
+                ctx,
+                vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
+                bytemuck::cast_slice(&data),
+            )
         };
 
         let mut images_srgb = vec![false; textures.len()];
@@ -325,273 +254,24 @@ impl SceneResources {
                 f => panic!("bad format {:#?}", f),
             };
             let mip_levels = img.width.max(img.height).ilog2() + 1;
-            let (image, allocation) = unsafe {
-                allocator
-                    .create_image(
-                        &vk::ImageCreateInfo::default()
-                            .image_type(vk::ImageType::TYPE_2D)
-                            .format(format)
-                            .extent(vk::Extent3D {
-                                width: img.width,
-                                height: img.height,
-                                depth: 1,
-                            })
-                            .mip_levels(mip_levels)
-                            .array_layers(1)
-                            .samples(vk::SampleCountFlags::TYPE_1)
-                            .tiling(vk::ImageTiling::OPTIMAL)
-                            .usage(
-                                vk::ImageUsageFlags::TRANSFER_DST
-                                    | vk::ImageUsageFlags::SAMPLED
-                                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                            )
-                            .initial_layout(vk::ImageLayout::UNDEFINED),
-                        &vk_mem::AllocationCreateInfo {
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            };
-            let view = unsafe {
-                device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(format)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(mip_levels)
-                                    .layer_count(1),
-                            ),
-                        None,
-                    )
-                    .unwrap()
-            };
 
-            let (transfer_buffer, mut transfer_allocation) = unsafe {
-                allocator
-                    .create_buffer(
-                        &vk::BufferCreateInfo::default()
-                            .size(pixels.len() as u64)
-                            .usage(vk::BufferUsageFlags::TRANSFER_SRC),
-                        &vk_mem::AllocationCreateInfo {
-                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::MAPPED,
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            };
-            let mapped = allocator
-                .get_allocation_info(&transfer_allocation)
-                .mapped_data
-                .cast::<u8>();
-            unsafe {
-                std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped, pixels.len());
-            }
-            allocator
-                .flush_allocation(&transfer_allocation, 0, pixels.len() as u64)
-                .unwrap();
-
-            let fence = unsafe {
-                device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
-                    .unwrap()
-            };
-            let cb = unsafe {
-                device
-                    .allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(*command_pool)
-                            .command_buffer_count(1),
-                    )
-                    .unwrap()[0]
-            };
-
-            unsafe {
-                device
-                    .begin_command_buffer(
-                        cb,
-                        &vk::CommandBufferBeginInfo::default()
-                            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                    )
-                    .unwrap();
-                device.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-                            .src_access_mask(vk::AccessFlags2::NONE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .old_layout(vk::ImageLayout::UNDEFINED)
-                            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .image(image)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(mip_levels)
-                                    .layer_count(1),
-                            ),
-                    ]),
-                );
-                device.cmd_copy_buffer_to_image(
-                    cb,
-                    transfer_buffer,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy::default()
-                        .buffer_offset(0)
-                        .image_subresource(
-                            vk::ImageSubresourceLayers::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .mip_level(0)
-                                .layer_count(1),
-                        )
-                        .image_extent(vk::Extent3D {
-                            width: img.width,
-                            height: img.height,
-                            depth: 1,
-                        })],
+            let mut image = image()
+                .extent_2d(vk::Extent2D {
+                    width: img.width,
+                    height: img.height,
+                })
+                .format(format)
+                .mip_levels(mip_levels)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+                .create_with_data(
+                    ctx,
+                    vk_mem::AllocationCreateFlags::DEDICATED_MEMORY,
+                    &pixels,
                 );
 
-                // now we generate the mip chain
-                let mut w = img.width;
-                let mut h = img.height;
+            image.generate_mipmaps(ctx, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
 
-                for i in 1..mip_levels {
-                    device.cmd_pipeline_barrier2(
-                        cb,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            vk::ImageMemoryBarrier2::default()
-                                .image(image)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                                .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(i - 1)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                ),
-                        ]),
-                    );
-
-                    let dst_w = (w / 2).max(1);
-                    let dst_h = (h / 2).max(1);
-
-                    device.cmd_blit_image(
-                        cb,
-                        image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        &[vk::ImageBlit::default()
-                            .src_offsets([
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: w as i32,
-                                    y: h as i32,
-                                    z: 1,
-                                },
-                            ])
-                            .src_subresource(
-                                vk::ImageSubresourceLayers::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .mip_level(i - 1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .dst_offsets([
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: dst_w as i32,
-                                    y: dst_h as i32,
-                                    z: 1,
-                                },
-                            ])
-                            .dst_subresource(
-                                vk::ImageSubresourceLayers::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .mip_level(i)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )],
-                        vk::Filter::LINEAR,
-                    );
-
-                    device.cmd_pipeline_barrier2(
-                        cb,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            vk::ImageMemoryBarrier2::default()
-                                .image(image)
-                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                                .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(i - 1)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                ),
-                        ]),
-                    );
-
-                    w = dst_w;
-                    h = dst_h;
-                }
-
-                device.cmd_pipeline_barrier2(
-                    cb,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[
-                        vk::ImageMemoryBarrier2::default()
-                            .image(image)
-                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-                            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-                            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(mip_levels - 1)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            ),
-                    ]),
-                );
-
-                device.end_command_buffer(cb).unwrap();
-                device
-                    .queue_submit(
-                        *queue,
-                        &[vk::SubmitInfo::default().command_buffers(&[cb])],
-                        fence,
-                    )
-                    .unwrap();
-                device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-                allocator.destroy_buffer(transfer_buffer, &mut transfer_allocation);
-            };
-
-            images.push((image, allocation, view));
+            images.push(image);
         }
 
         let mut vertex_buffers = Vec::new();
@@ -683,54 +363,19 @@ impl SceneResources {
                     bounds,
                 });
 
-                let (vertex_buffer, mut vertex_allocation) = unsafe {
-                    allocator.create_buffer(
-                        &vk::BufferCreateInfo::default()
-                            .size((std::mem::size_of::<VertexData>() * vertices.len()) as u64)
-                            .usage(vk::BufferUsageFlags::VERTEX_BUFFER),
-                        &vk_mem::AllocationCreateInfo {
-                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                | vk_mem::AllocationCreateFlags::HOST_ACCESS_ALLOW_TRANSFER_INSTEAD
-                                | vk_mem::AllocationCreateFlags::MAPPED,
-                            usage: vk_mem::MemoryUsage::Auto,
-                            ..Default::default()
-                        },
-                    ).unwrap()
-                };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        vertices.as_ptr() as *const u8,
-                        allocator.map_memory(&mut vertex_allocation).unwrap(),
-                        std::mem::size_of::<VertexData>() * vertices.len(),
-                    );
-                    allocator.unmap_memory(&mut vertex_allocation);
-                }
-                vertex_buffers.push((vertex_buffer, vertex_allocation));
+                vertex_buffers.push(Buffer::from_data(
+                    ctx,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    bytemuck::cast_slice(&vertices),
+                ));
 
-                let (index_buffer, mut index_allocation) = unsafe {
-                    allocator.create_buffer(
-                                        &vk::BufferCreateInfo::default()
-                                            .size((std::mem::size_of::<u32>() * indices.len()) as u64)
-                                            .usage(vk::BufferUsageFlags::INDEX_BUFFER),
-                                        &vk_mem::AllocationCreateInfo {
-                                            flags: vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE
-                                                | vk_mem::AllocationCreateFlags::HOST_ACCESS_ALLOW_TRANSFER_INSTEAD
-                                                | vk_mem::AllocationCreateFlags::MAPPED,
-                                            usage: vk_mem::MemoryUsage::Auto,
-                                            ..Default::default()
-                                        },
-                                    ).unwrap()
-                };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        indices.as_ptr() as *const u8,
-                        allocator.map_memory(&mut index_allocation).unwrap(),
-                        std::mem::size_of::<u32>() * indices.len(),
-                    );
-                    allocator.unmap_memory(&mut index_allocation);
-                }
+                index_buffers.push(Buffer::from_data(
+                    ctx,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    bytemuck::cast_slice(&indices),
+                ));
+
                 index_counts.push(indices.len() as u32);
-                index_buffers.push((index_buffer, index_allocation));
             }
         }
 

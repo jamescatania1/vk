@@ -13,6 +13,7 @@ mod input;
 mod renderer;
 mod scene;
 mod screen;
+mod utils;
 use renderer::Renderer;
 
 include!(concat!(env!("OUT_DIR"), "/shaders.rs"));
